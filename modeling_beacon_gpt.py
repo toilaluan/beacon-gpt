@@ -186,16 +186,16 @@ class BeaconGPT(nn.Module):
         return logits, loss
 
     def generate(
-        self, input_ids: torch.Tensor, max_new_tokens: int = 16
+        self, input_ids: torch.Tensor, max_new_tokens: int = 16, device: str = "cpu"
     ) -> torch.Tensor:
         assert input_ids.size(0) == 1, "Only batch size 1 is supported for generate"
         promise_kv_len = input_ids.size(1) + max_new_tokens
         c_k = [
-            torch.empty(1, self.n_head, promise_kv_len, self.head_dim, device="cpu")
+            torch.empty(1, self.n_head, promise_kv_len, self.head_dim, device=device)
             for _ in range(self.n_layer)
         ]
         c_v = [
-            torch.empty(1, self.n_head, promise_kv_len, self.head_dim, device="cpu")
+            torch.empty(1, self.n_head, promise_kv_len, self.head_dim, device=device)
             for _ in range(self.n_layer)
         ]
         print("pre-allocated kv cache", c_k[0].shape, c_v[0].shape)
@@ -208,7 +208,7 @@ class BeaconGPT(nn.Module):
             H=None,
             Q_LEN=input_ids.size(1),
             KV_LEN=input_ids.size(1),
-            device="cpu",
+            device=device,
         )
         for i, block in enumerate(self.blocks):
             x, k, v = block(x, mask)
@@ -222,7 +222,7 @@ class BeaconGPT(nn.Module):
             H=None,
             Q_LEN=1,
             KV_LEN=promise_kv_len,
-            device="cpu",
+            device=device,
         )
         logits = self.lm_head(x)
         new_token_id = torch.argmax(logits[0, 0, :], dim=-1, keepdim=True)
