@@ -4,6 +4,7 @@ from datasets import load_dataset
 import tiktoken
 import torch
 import torch.distributed as dist
+import time
 
 tokenizer = tiktoken.get_encoding("gpt2")
 print(tokenizer.n_vocab)
@@ -34,11 +35,13 @@ model = BeaconGPT(
 )
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+model = torch.compile(model)
 
 for i in range(1000):
     data = stream_input_ids(ds_iter, 128, "cpu")
+    start_time = time.time()
     logits, loss = model(data, data)
     loss.backward()
     optimizer.step()
     optimizer.zero_grad()
-    print(i, loss)
+    print(i, loss, time.time() - start_time)

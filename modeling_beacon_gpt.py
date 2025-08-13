@@ -37,11 +37,18 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("cos", torch.cos(angles))
         self.register_buffer("sin", torch.sin(angles))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        seq_len = x.size(2)
-        assert seq_len <= self.max_seq_len, "input sequence length exceeds max_seq_len"
-        cos = self.cos[:seq_len, :]
-        sin = self.sin[:seq_len, :]
+    def forward(self, x: torch.Tensor, seq_index: int = None) -> torch.Tensor:
+        if seq_index is None:
+            seq_len = x.size(2)
+            assert (
+                seq_len <= self.max_seq_len
+            ), "input sequence length exceeds max_seq_len"
+            cos = self.cos[:seq_len, :]
+            sin = self.sin[:seq_len, :]
+        else:
+            cos = self.cos[seq_index, :].unsqueeze(0)
+            sin = self.sin[seq_index, :].unsqueeze(0)
+
         x_odd = x[:, :, :, 1::2].float()
         x_even = x[:, :, :, ::2].float()
         y_odd = x_odd * cos - x_even * sin
@@ -83,9 +90,9 @@ class MultiHeadAttention(nn.Module):
         k = norm(k)
         q = self.rotary_emb(q)
         k = self.rotary_emb(k)
-        q = flex_attention(q, k, v, block_mask=block_mask)
-        q = q.transpose(1, 2).reshape(B, L, self.hidden_size)
-        return self.out_proj(q)
+        out = flex_attention(q, k, v, block_mask=block_mask)
+        out = out.transpose(1, 2).reshape(B, L, self.hidden_size)
+        return self.out_proj(out), k, v
 
 
 class MLP(nn.Module):
@@ -112,9 +119,10 @@ class Block(nn.Module):
         self.mlp = MLP(hidden_size, 4 * hidden_size)
 
     def forward(self, x: torch.Tensor, block_mask: BlockMask) -> torch.Tensor:
-        x = x + self.attn(norm(x), block_mask)
+        x_attn, k, v = self.attn(norm(x), block_mask)
+        x = x + x_attn
         x = x + self.mlp(norm(x))
-        return x
+        return x, k, v
 
 
 class BeaconGPT(nn.Module):
@@ -131,6 +139,9 @@ class BeaconGPT(nn.Module):
     ):
         super().__init__()
         self.wte = nn.Embedding(vocab_size, hidden_size)
+        self.n_layer = n_layer
+        self.n_head = n_head
+        self.head_dim = hidden_size // n_head
         self.dropout = nn.Dropout(dropout)
         self.blocks = nn.ModuleList(
             [Block(n_head, hidden_size, max_seq_len) for _ in range(n_layer)]
@@ -175,7 +186,7 @@ class BeaconGPT(nn.Module):
         x = self.wte(input_ids)
         x = norm(x)
         for block in self.blocks:
-            x = x + block(x, self.mask)
+            x = x + block(x, self.mask)[0]
         logits = self.lm_head(x)
 
         loss = None
@@ -192,14 +203,68 @@ class BeaconGPT(nn.Module):
         self, input_ids: torch.Tensor, max_new_tokens: int = 16
     ) -> torch.Tensor:
         assert input_ids.size(0) == 1, "Only batch size 1 is supported for generate"
-        input_embeds = self.wte(input_ids)
-        x = input_embeds
-        for _ in range(max_new_tokens):
-            logits = self.forward(x)
-            token_id = torch.argmax(logits[0, -1, :], dim=-1, keepdim=True)
-            token_emb = self.wte(token_id)
-            x = torch.cat([x, token_emb], dim=1)
-            yield token_id
+        promise_kv_len = input_ids.size(1) + max_new_tokens
+        c_k = [
+            torch.empty(1, self.n_head, promise_kv_len, self.head_dim, device="cpu")
+            for _ in range(self.n_layer)
+        ]
+        c_v = [
+            torch.empty(1, self.n_head, promise_kv_len, self.head_dim, device="cpu")
+            for _ in range(self.n_layer)
+        ]
+        print("pre-allocated kv cache", c_k[0].shape, c_v[0].shape)
+        generated_ids = []
+        x = self.wte(input_ids)
+        x = norm(x)
+        mask = create_block_mask(
+            lambda b, h, q_idx, kv_idx: q_idx >= kv_idx,
+            B=None,
+            H=None,
+            Q_LEN=input_ids.size(1),
+            KV_LEN=input_ids.size(1),
+            device="cpu",
+        )
+        for i, block in enumerate(self.blocks):
+            x, k, v = block(x, mask)
+            c_k[i][:, :, : k.size(2), :] = k
+            c_v[i][:, :, : v.size(2), :] = v
+
+        seq_index = input_ids.size(1)
+        mask = create_block_mask(
+            lambda b, h, q_idx, kv_idx: q_idx + seq_index >= kv_idx,
+            B=None,
+            H=None,
+            Q_LEN=1,
+            KV_LEN=promise_kv_len,
+            device="cpu",
+        )
+        logits = self.lm_head(x)
+        new_token_id = torch.argmax(logits[0, 0, :], dim=-1, keepdim=True)
+        generated_ids.append(new_token_id.item())
+        for _ in range(max_new_tokens - 1):
+            x = self.wte(new_token_id.unsqueeze(1))
+            x = norm(x)
+            for i, block in enumerate(self.blocks):
+                B, L, _ = x.shape
+                q, k, v = block.attn.to_qkv(x).split(block.attn.hidden_size, dim=2)
+                q = q.view(B, L, self.n_head, self.head_dim).transpose(1, 2)
+                k = k.view(B, L, self.n_head, self.head_dim).transpose(1, 2)
+                v = v.view(B, L, self.n_head, self.head_dim).transpose(1, 2)
+                q = norm(q)
+                k = norm(k)
+                q = block.attn.rotary_emb(q, seq_index=seq_index)
+                k = block.attn.rotary_emb(k, seq_index=seq_index)
+                c_k[i][:, :, seq_index, :] = k.squeeze(2)
+                c_v[i][:, :, seq_index, :] = v.squeeze(2)
+                out = flex_attention(q, c_k[i], c_v[i], block_mask=mask)
+                out = out.transpose(1, 2).reshape(B, L, block.attn.hidden_size)
+                x = x + out
+            seq_index += 1
+            x = x + block.mlp(norm(x))
+            logits = self.lm_head(x)
+            new_token_id = torch.argmax(logits[0, 0, :], dim=-1, keepdim=True)
+            generated_ids.append(new_token_id.item())
+        return generated_ids
 
 
 if __name__ == "__main__":
@@ -208,11 +273,11 @@ if __name__ == "__main__":
         hidden_size=128,
         n_layer=4,
         n_head=4,
-        max_seq_len=64,
+        max_seq_len=128,
     )
     print(model)
 
     x = torch.randint(0, 512, (1, 64))
-    print(x.shape)
-    out = model(x)
+    print(x)
+    out = model.generate(x, max_new_tokens=16)
     print(out)
