@@ -21,7 +21,7 @@ def stream_input_ids(ds_iter, max_seq_len, device):
     return ids
 
 
-MAX_SEQ_LEN = 128
+MAX_SEQ_LEN = 1024
 
 example = stream_input_ids(ds_iter, 128, "cpu")
 
@@ -51,6 +51,7 @@ print(prefix_test_ids.shape)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 model.to(device)
+prefix_test_ids = prefix_test_ids.to(device)
 
 mask = create_block_mask(
     lambda b, h, q_idx, kv_idx: q_idx >= kv_idx,
