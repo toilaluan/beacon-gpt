@@ -39,7 +39,7 @@ model = BeaconGPT(
 print(sum(p.numel() for p in model.parameters()))
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
-# model = torch.compile(model)
+model = torch.compile(model)
 
 prefix_test = "Hello,"
 
@@ -70,7 +70,7 @@ for i in range(1000):
     optimizer.step()
     optimizer.zero_grad()
     if i % 50 == 0:
-        print(i, loss, time.time() - start_time)
+        print(i, loss.item(), time.time() - start_time)
     if i % 100 == 0:
         output = model.generate(prefix_test_ids, max_new_tokens=16, device=device)
         print(tokenizer.decode(output))
