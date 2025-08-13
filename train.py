@@ -4,18 +4,26 @@ from datasets import load_dataset
 import tiktoken
 import torch
 import time
+import wandb
+
+wandb.init(project="beacon-gpt")
 
 tokenizer = tiktoken.get_encoding("gpt2")
 print(tokenizer.n_vocab)
 
 ds = load_dataset("alkibijad/fineweb-edu-sample-10BT-gpt2tokenized", streaming=True)
-ds_iter = iter(ds["train_000001"])
 
 
-def stream_input_ids(ds_iter, max_seq_len, device):
+def stream_input_ids(ds, max_seq_len, device):
+    shard_iter = iter(ds)
+    data_iter = iter(ds[shard_iter])
     ids = []
     while len(ids) < max_seq_len:
-        ids.extend(next(ds_iter)["values"])
+        try:
+            ids.extend(next(data_iter)["values"])
+        except StopIteration:
+            shard_iter = next(shard_iter)
+            data_iter = iter(ds[shard_iter])
     ids = ids[:max_seq_len]
     ids = torch.tensor([ids], dtype=torch.long, device=device)
     return ids
@@ -23,7 +31,7 @@ def stream_input_ids(ds_iter, max_seq_len, device):
 
 MAX_SEQ_LEN = 2048
 
-example = stream_input_ids(ds_iter, 128, "cpu")
+example = stream_input_ids(ds, 128, "cpu")
 
 print(example.shape)
 
@@ -41,7 +49,7 @@ print(sum(p.numel() for p in model.parameters()))
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
 model = torch.compile(model)
 
-prefix_test = "Hello,"
+prefix_test = "Hello, "
 
 prefix_test_ids = torch.tensor(
     [tokenizer.encode(prefix_test)], dtype=torch.long, device="cpu"
@@ -63,7 +71,7 @@ mask = create_block_mask(
 )
 
 for i in range(1000):
-    data = stream_input_ids(ds_iter, MAX_SEQ_LEN, device)
+    data = stream_input_ids(ds, MAX_SEQ_LEN, device)
     start_time = time.time()
     logits, loss = model(data, data, mask)
     loss.backward()
@@ -71,6 +79,7 @@ for i in range(1000):
     optimizer.zero_grad()
     if i % 50 == 0:
         print(i, loss.item(), time.time() - start_time)
+        wandb.log({"loss": loss.item()})
     if i % 100 == 0:
         output = model.generate(prefix_test_ids, max_new_tokens=16, device=device)
-        print(tokenizer.decode(output))
+        print(prefix_test, tokenizer.decode(output))
