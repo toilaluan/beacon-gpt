@@ -150,24 +150,7 @@ class BeaconGPT(nn.Module):
 
         self.use_beacon = use_beacon
         self.beacon_offset = beacon_offset
-        if self.use_beacon:
-            self.mask = create_block_mask(
-                create_beacon_mask(max_seq_len, beacon_offset),
-                B=None,
-                H=None,
-                Q_LEN=max_seq_len,
-                KV_LEN=max_seq_len,
-                device="cpu",
-            )
-        else:
-            self.mask = create_block_mask(
-                lambda b, h, q_idx, kv_idx: q_idx >= kv_idx,
-                B=None,
-                H=None,
-                Q_LEN=max_seq_len,
-                KV_LEN=max_seq_len,
-                device="cpu",
-            )
+
         self.init_weights()
 
     def init_weights(self):
@@ -180,13 +163,16 @@ class BeaconGPT(nn.Module):
                     module.weight.uniform_(-bound, bound)
 
     def forward(
-        self, input_ids: torch.Tensor, labels: torch.Tensor = None
+        self,
+        input_ids: torch.Tensor,
+        labels: torch.Tensor = None,
+        mask: BlockMask = None,
     ) -> torch.Tensor:
         assert input_ids.size(0) == 1, "Only batch size 1 is supported with flex-attn"
         x = self.wte(input_ids)
         x = norm(x)
         for block in self.blocks:
-            x = x + block(x, self.mask)[0]
+            x = x + block(x, mask)[0]
         logits = self.lm_head(x)
 
         loss = None

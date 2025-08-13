@@ -1,9 +1,8 @@
 from modeling_beacon_gpt import BeaconGPT
-from transformers import AutoTokenizer, AutoConfig
+from torch.nn.attention.flex_attention import create_block_mask
 from datasets import load_dataset
 import tiktoken
 import torch
-import torch.distributed as dist
 import time
 
 tokenizer = tiktoken.get_encoding("gpt2")
@@ -22,6 +21,8 @@ def stream_input_ids(ds_iter, max_seq_len, device):
     return ids
 
 
+MAX_SEQ_LEN = 128
+
 example = stream_input_ids(ds_iter, 128, "cpu")
 
 print(example.shape)
@@ -31,8 +32,11 @@ model = BeaconGPT(
     hidden_size=64,
     n_layer=4,
     n_head=4,
-    max_seq_len=128,
+    max_seq_len=MAX_SEQ_LEN,
 )
+
+# count the number of parameters
+print(sum(p.numel() for p in model.parameters()))
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
 # model = torch.compile(model)
@@ -44,10 +48,23 @@ prefix_test_ids = torch.tensor(
 )
 print(prefix_test_ids.shape)
 
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+model.to(device)
+
+mask = create_block_mask(
+    lambda b, h, q_idx, kv_idx: q_idx >= kv_idx,
+    B=None,
+    H=None,
+    Q_LEN=MAX_SEQ_LEN,
+    KV_LEN=MAX_SEQ_LEN,
+    device=device,
+)
+
 for i in range(1000):
-    data = stream_input_ids(ds_iter, 128, "cpu")
+    data = stream_input_ids(ds_iter, MAX_SEQ_LEN, device)
     start_time = time.time()
-    logits, loss = model(data, data)
+    logits, loss = model(data, data, mask)
     loss.backward()
     optimizer.step()
     optimizer.zero_grad()
