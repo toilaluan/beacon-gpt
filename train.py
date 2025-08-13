@@ -29,9 +29,9 @@ print(example.shape)
 
 model = BeaconGPT(
     vocab_size=tokenizer.n_vocab,
-    hidden_size=64,
-    n_layer=4,
-    n_head=4,
+    hidden_size=768,
+    n_layer=12,
+    n_head=12,
     max_seq_len=MAX_SEQ_LEN,
 )
 
@@ -69,7 +69,8 @@ for i in range(1000):
     loss.backward()
     optimizer.step()
     optimizer.zero_grad()
-    print(i, loss, time.time() - start_time)
+    if i % 50 == 0:
+        print(i, loss, time.time() - start_time)
     if i % 100 == 0:
         output = model.generate(prefix_test_ids, max_new_tokens=16, device=device)
         print(tokenizer.decode(output))
