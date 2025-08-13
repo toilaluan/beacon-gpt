@@ -90,7 +90,6 @@ class MultiHeadAttention(nn.Module):
         k = norm(k)
         q = self.rotary_emb(q)
         k = self.rotary_emb(k)
-        print(q.get_device(), k.get_device(), v.get_device())
         out = flex_attention(q, k, v, block_mask=block_mask)
         out = out.transpose(1, 2).reshape(B, L, self.hidden_size)
         return self.out_proj(out), k, v

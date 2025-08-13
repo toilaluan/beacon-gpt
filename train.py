@@ -71,5 +71,5 @@ for i in range(1000):
     optimizer.zero_grad()
     print(i, loss, time.time() - start_time)
     if i % 100 == 0:
-        output = model.generate(prefix_test_ids, max_new_tokens=16)
+        output = model.generate(prefix_test_ids, max_new_tokens=16, device=device)
         print(tokenizer.decode(output))
