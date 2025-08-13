@@ -81,7 +81,7 @@ for i in range(1000):
     if i % 50 == 0:
         print(i, loss.item(), time.time() - start_time)
         writer.add_scalar("loss", loss.item(), i)
-    if i % 100 == 0:
+    if (i + 1) % 1000 == 0:
         output = model.generate(prefix_test_ids, max_new_tokens=16, device=device)
         decode = prefix_test + tokenizer.decode(output)
         print(decode)
