@@ -162,6 +162,8 @@ class BeaconGPT(nn.Module):
                 with torch.no_grad():
                     module.weight.uniform_(-bound, bound)
 
+        self.lm_head.weight.data.zero_()
+
     def forward(
         self,
         input_ids: torch.Tensor,
