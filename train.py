@@ -84,4 +84,5 @@ for i in range(1000):
     if i % 100 == 0:
         output = model.generate(prefix_test_ids, max_new_tokens=16, device=device)
         decode = prefix_test + tokenizer.decode(output)
+        print(decode)
         writer.add_text("decode", decode, i)
