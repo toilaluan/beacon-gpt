@@ -32,9 +32,13 @@ model = BeaconGPT(
     n_head=4,
     max_seq_len=128,
 )
-model.to("cpu")
-example = example.to("cpu")
-print(model)
-logits, loss = model(example, example)
-print(logits.shape)
-print(loss)
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+
+for i in range(1000):
+    data = stream_input_ids(ds_iter, 128, "cpu")
+    logits, loss = model(data, data)
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad()
+    print(i, loss)
