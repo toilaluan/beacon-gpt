@@ -62,6 +62,16 @@ class MultiHeadAttention(nn.Module):
         )
         self.to_qkv = nn.Linear(hidden_size, 3 * hidden_size, bias=False)
         self.out_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.init_weights()
+
+    def init_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                in_features = module.in_features
+                std = 0.5 * (in_features**-0.5)
+                bound = 3**0.5 * std
+                with torch.no_grad():
+                    module.weight.uniform_(-bound, bound)
 
     def forward(self, x: torch.Tensor, block_mask: BlockMask) -> torch.Tensor:
         B, L, _ = x.shape
@@ -84,6 +94,12 @@ class MLP(nn.Module):
         self.w1 = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.w2 = nn.Linear(intermediate_size, hidden_size, bias=False)
         self.act = nn.GELU()
+        self.init_weights()
+
+    def init_weights(self):
+        # modded nanogpt init
+        self.w1.weight.detach().zero_()
+        self.w2.weight.detach().zero_()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.w2(self.act(self.w1(x)))
@@ -141,6 +157,16 @@ class BeaconGPT(nn.Module):
                 KV_LEN=max_seq_len,
                 device="cpu",
             )
+        self.init_weights()
+
+    def init_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                in_features = module.in_features
+                std = 0.5 * (in_features**-0.5)
+                bound = 3**0.5 * std
+                with torch.no_grad():
+                    module.weight.uniform_(-bound, bound)
 
     def forward(
         self, input_ids: torch.Tensor, labels: torch.Tensor = None
@@ -156,6 +182,7 @@ class BeaconGPT(nn.Module):
         if labels is not None:
             logits = logits.float()
             labels = F.pad(labels, (0, 1), value=-100)
+            labels = labels[:, 1:]
             loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=-100
             )

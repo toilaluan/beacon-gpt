@@ -35,6 +35,6 @@ model = BeaconGPT(
 model.to("cpu")
 example = example.to("cpu")
 print(model)
-logits, loss = model(example)
+logits, loss = model(example, example)
 print(logits.shape)
 print(loss)
