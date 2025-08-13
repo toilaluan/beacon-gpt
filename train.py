@@ -21,7 +21,7 @@ def stream_input_ids(ds_iter, max_seq_len, device):
     return ids
 
 
-MAX_SEQ_LEN = 1024
+MAX_SEQ_LEN = 2048
 
 example = stream_input_ids(ds_iter, 128, "cpu")
 
