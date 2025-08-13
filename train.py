@@ -4,9 +4,10 @@ from datasets import load_dataset
 import tiktoken
 import torch
 import time
-import wandb
 
-wandb.init(project="beacon-gpt", entity="toilaluan")
+from torch.utils.tensorboard import SummaryWriter
+
+writer = SummaryWriter()
 
 tokenizer = tiktoken.get_encoding("gpt2")
 print(tokenizer.n_vocab)
@@ -79,7 +80,8 @@ for i in range(1000):
     optimizer.zero_grad()
     if i % 50 == 0:
         print(i, loss.item(), time.time() - start_time)
-        wandb.log({"loss": loss.item()})
+        writer.add_scalar("loss", loss.item(), i)
     if i % 100 == 0:
         output = model.generate(prefix_test_ids, max_new_tokens=16, device=device)
-        print(prefix_test, tokenizer.decode(output))
+        decode = prefix_test + tokenizer.decode(output)
+        writer.add_text("decode", decode, i)
