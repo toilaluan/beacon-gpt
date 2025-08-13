@@ -17,14 +17,14 @@ ds = load_dataset("alkibijad/fineweb-edu-sample-10BT-gpt2tokenized", streaming=T
 
 def stream_input_ids(ds, max_seq_len, device):
     shard_iter = iter(ds)
-    data_iter = iter(ds[shard_iter])
+    data_iter = iter(shard_iter)
     ids = []
     while len(ids) < max_seq_len:
         try:
             ids.extend(next(data_iter)["values"])
         except StopIteration:
             shard_iter = next(shard_iter)
-            data_iter = iter(ds[shard_iter])
+            data_iter = iter(shard_iter)
     ids = ids[:max_seq_len]
     ids = torch.tensor([ids], dtype=torch.long, device=device)
     return ids
