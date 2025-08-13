@@ -35,7 +35,14 @@ model = BeaconGPT(
 )
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
-model = torch.compile(model)
+# model = torch.compile(model)
+
+prefix_test = "Hello,"
+
+prefix_test_ids = torch.tensor(
+    [tokenizer.encode(prefix_test)], dtype=torch.long, device="cpu"
+)
+print(prefix_test_ids.shape)
 
 for i in range(1000):
     data = stream_input_ids(ds_iter, 128, "cpu")
@@ -45,3 +52,6 @@ for i in range(1000):
     optimizer.step()
     optimizer.zero_grad()
     print(i, loss, time.time() - start_time)
+    if i % 100 == 0:
+        output = model.generate(prefix_test_ids, max_new_tokens=16)
+        print(tokenizer.decode(output))

@@ -229,7 +229,7 @@ class BeaconGPT(nn.Module):
             c_k[i][:, :, : k.size(2), :] = k
             c_v[i][:, :, : v.size(2), :] = v
 
-        seq_index = input_ids.size(1)
+        seq_index = input_ids.size(1) - 1
         mask = create_block_mask(
             lambda b, h, q_idx, kv_idx: q_idx + seq_index >= kv_idx,
             B=None,
