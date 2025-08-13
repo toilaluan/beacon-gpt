@@ -34,7 +34,6 @@ class RotaryEmbedding(nn.Module):
             self.base ** (torch.arange(0, head_dim, 2).float() / head_dim)
         )
         angles = torch.outer(torch.arange(max_seq_len), inv_freq)
-        print(angles.shape)
         self.register_buffer("cos", torch.cos(angles))
         self.register_buffer("sin", torch.sin(angles))
 
@@ -72,10 +71,8 @@ class MultiHeadAttention(nn.Module):
         v = v.view(B, L, self.n_head, self.head_dim).transpose(1, 2)
         q = norm(q)
         k = norm(k)
-        print(q.shape)
         q = self.rotary_emb(q)
         k = self.rotary_emb(k)
-        print(q.shape)
         q = flex_attention(q, k, v, block_mask=block_mask)
         q = q.transpose(1, 2).reshape(B, L, self.hidden_size)
         return self.out_proj(q)
@@ -144,7 +141,6 @@ class BeaconGPT(nn.Module):
                 KV_LEN=max_seq_len,
                 device="cpu",
             )
-        print(self.mask)
 
     def forward(
         self, input_ids: torch.Tensor, labels: torch.Tensor = None
