@@ -6,7 +6,7 @@ import torch
 import time
 import wandb
 
-wandb.init(project="beacon-gpt")
+wandb.init(project="beacon-gpt", entity="toilaluan")
 
 tokenizer = tiktoken.get_encoding("gpt2")
 print(tokenizer.n_vocab)
