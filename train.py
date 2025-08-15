@@ -15,9 +15,11 @@ from datasets import load_dataset
 import tiktoken
 from tqdm import tqdm
 from torch.nn.parallel import DistributedDataParallel as DDP
-
+import wandb
 from modeling_beacon_gpt import BeaconGPT
 import torch.distributed as dist
+
+
 
 def setup_distributed() -> tuple[int, int, int]:
     if "RANK" not in os.environ:  # single-GPU
@@ -147,6 +149,9 @@ class Trainer:
         setup_distributed()
         self.local_rank = dist.get_rank()
         self.world_size = dist.get_world_size()
+        if self.local_rank == 0:
+            wandb.init(project="beacon-gpt")
+
         print(f"local_rank: {self.local_rank}, world_size: {self.world_size}")
         self.config = config
         self.step = 0
@@ -401,6 +406,12 @@ class Trainer:
                 self.writer.add_scalar(
                     "train/tokens_per_second", tokens_per_sec, self.step
                 )
+                wandb.log({
+                    "train/loss": avg_loss,
+                    "train/learning_rate": metrics["lr"],
+                    "train/tokens_per_second": tokens_per_sec,
+                    "train/mask_time": metrics["mask_time"],
+                })
 
                 accumulated_loss = 0.0
                 start_time = time.time()
@@ -410,6 +421,9 @@ class Trainer:
                 sample_text = self.generate_sample()
                 print(f"Sample: {sample_text}")
                 self.writer.add_text("samples/generated", sample_text, self.step)
+                wandb.log({
+                    "samples/generated": sample_text,
+                })
 
             # Save checkpoint
             if self.step % self.config.save_interval == 0 and self.step > 0 and self.local_rank == 0:
