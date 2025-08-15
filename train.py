@@ -18,7 +18,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import wandb
 from modeling_beacon_gpt import BeaconGPT
 import torch.distributed as dist
-
+import glob
+from pathlib import Path
 
 
 def setup_distributed() -> tuple[int, int, int]:
@@ -64,8 +65,7 @@ class TrainingConfig:
     sample_interval: int = 500
 
     # Data config
-    dataset_name: str = "HuggingFaceFW/fineweb"
-    dataset_split: str = "train"
+    dataset_bin_pattern: str = "./data/*train*.bin"
 
     # System config
     device: str = "auto"  # "auto", "cuda", "cpu"
@@ -110,36 +110,65 @@ class DataLoader:
         self.local_rank = local_rank
         self.world_size = world_size
         # Load streaming dataset
-        self.dataset = load_dataset(
-            config.dataset_name, streaming=True, split=config.dataset_split
-        )
-        self.dataset_iter = iter(self.dataset)
-        self.index = 0
+        self.bin_files = [Path(file) for file in glob.glob(config.dataset_bin_pattern)]
+        self.bin_files_iter = iter(self.bin_files)
+        self.max_seq_len = config.max_seq_len * config.batch_size
+        self.dataset_iter = self._gen_valid_sentence_ids()
+
+    def _load_data_shard(self,file: Path):
+        header = torch.from_file(str(file), False, 256, dtype=torch.int32) # header is 256 int32
+        assert header[0] == 20240520, "magic number mismatch in the data .bin file"
+        assert header[1] == 1, "unsupported version"
+        num_tokens = int(header[2]) # number of tokens (claimed)
+        with file.open("rb", buffering=0) as f:
+            tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True) # avoid pin_memory copy by @YouJiacheng
+            f.seek(256 * 4)
+            nbytes = f.readinto(tokens.numpy()) # avoid bytes->array copy by @YouJiacheng
+            assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
+        return tokens
+
+    def _gen_valid_sentence_ids(self) -> torch.Tensor:
+        for bin_file in self.bin_files_iter:
+            tokens = self._load_data_shard(bin_file)
+            tokens_per_rank = tokens.shape[0] // self.world_size
+            rank_start = tokens_per_rank * self.local_rank
+            rank_end = rank_start + tokens_per_rank
+            valid_sentence_ids = tokens[rank_start:rank_end]
+            
+            index = 0
+            while index < valid_sentence_ids.shape[0]:
+                # Look for EOT token in current window
+                segment = valid_sentence_ids[index:index+self.max_seq_len]
+                eot_token_idx = (segment == self.eot_token).nonzero(as_tuple=True)[0]
+                
+                if len(eot_token_idx) == 0:
+                    # No EOT token found in this segment, skip ahead
+                    index += self.max_seq_len
+                    continue
+                
+                # Start from the first EOT token found
+                eot_start = index + eot_token_idx[0].item()
+                eot_end = min(eot_start + self.max_seq_len, valid_sentence_ids.shape[0])
+                
+                segment = valid_sentence_ids[eot_start:eot_end]
+                
+                # Only yield if we have a full sequence or this is the last possible segment
+                if segment.shape[0] == self.max_seq_len or eot_end == valid_sentence_ids.shape[0]:
+                    yield segment
+                
+                index = eot_start + self.max_seq_len
 
     def get_batch(self) -> torch.Tensor:
         """Get a batch of token IDs"""
-        ids = []
-        while len(ids) < self.config.max_seq_len * self.config.batch_size:
-            self.index += 1
-            if self.index % self.world_size != self.local_rank:
-                continue
-            try:
-                text = next(self.dataset_iter)["text"]
-                encoded = self.tokenizer.encode(text, allowed_special="all")
-                ids.extend([self.eot_token] + encoded[:self.config.max_seq_len-1])
-            except StopIteration:
-                # Reset iterator if we reach the end
-                self.dataset_iter = iter(self.dataset)
-                text = next(self.dataset_iter)["text"]
-                encoded = self.tokenizer.encode(text, allowed_special="all")
-                ids.extend([self.eot_token] + encoded)
-
-        # Truncate to max_seq_len
-        ids = ids[: self.config.max_seq_len * self.config.batch_size]
-        labels = ids[1:]
-        ids = ids[:-1]
+        t0 = time.time()
+        ids = next(self.dataset_iter)
+        labels = ids[1:].clone()
+        ids = ids[:-1].clone()
         device = self.config.resolve_device()
-        return torch.tensor([ids], dtype=torch.long, device=device), torch.tensor([labels], dtype=torch.long, device=device)
+        ids = ids.to(dtype=torch.int32, device=device, non_blocking=True)
+        labels = labels.to(dtype=torch.int64, device=device, non_blocking=True)
+        t1 = time.time()
+        return ids, labels, t1 - t0
 
 
 class Trainer:
@@ -187,6 +216,8 @@ class Trainer:
 
         # Move to device
         self.model.to(self.device)
+        for param in self.model.parameters():
+            dist.broadcast(param.detach(), 0)
         self.model = DDP(self.model, device_ids=[self.local_rank])
 
         # Compile model if requested
@@ -271,7 +302,7 @@ class Trainer:
 
         # Prepare labels (shifted input for next token prediction)
         # labels = input_ids.clone()
-
+        t0 = time.time()
         if self.config.mixed_precision and self.scaler is not None:
             with torch.amp.autocast(device_type=self.device):
                 logits, loss = self.model(input_ids, labels=labels, mask=mask)
@@ -283,11 +314,13 @@ class Trainer:
             logits, loss = self.model(input_ids, labels=labels, mask=mask)
             loss = loss / self.config.gradient_accumulation_steps
             loss.backward()
-
+        t1 = time.time()
+        loss_time = t1 - t0
         return {
             "loss": loss.item() * self.config.gradient_accumulation_steps,
             "lr": self.scheduler.get_last_lr()[0],
             "mask_time": mask_time,
+            "loss_time": loss_time,
         }
 
     def generate_sample(self) -> str:
@@ -360,7 +393,9 @@ class Trainer:
 
         while self.step < self.config.max_steps:
             # Get batch
-            input_ids, labels = self.data_loader.get_batch()
+            input_ids, labels, token_time = self.data_loader.get_batch()
+            input_ids = input_ids.unsqueeze(0)
+            labels = labels.unsqueeze(0)
             total_tokens += input_ids.shape[1]
 
             # Training step
@@ -397,20 +432,15 @@ class Trainer:
 
                 print(
                     f"Step {self.step}: loss={avg_loss:.4f}, lr={metrics['lr']:.2e}, "
-                    f"tok/s={tokens_per_sec:.0f}, mask_time={metrics['mask_time']:.4f}, input_shape={input_ids.shape}, total_tokens={total_tokens}"
-                )
-
-                # Log to tensorboard
-                self.writer.add_scalar("train/loss", avg_loss, self.step)
-                self.writer.add_scalar("train/learning_rate", metrics["lr"], self.step)
-                self.writer.add_scalar(
-                    "train/tokens_per_second", tokens_per_sec, self.step
+                    f"tok/s={tokens_per_sec:.0f}, mask_time={metrics['mask_time']:.4f}, loss_time={metrics['loss_time']:.4f}, input_shape={input_ids.shape}, total_tokens={total_tokens}, token_time={token_time:.4f}"
                 )
                 wandb.log({
                     "train/loss": avg_loss,
                     "train/learning_rate": metrics["lr"],
                     "train/tokens_per_second": tokens_per_sec,
                     "train/mask_time": metrics["mask_time"],
+                    "train/read_token_time": token_time,
+                    "train/loss_time": metrics["loss_time"],
                 })
 
                 accumulated_loss = 0.0
