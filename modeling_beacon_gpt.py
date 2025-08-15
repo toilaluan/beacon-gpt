@@ -6,7 +6,9 @@ from torch.nn.attention.flex_attention import (
     flex_attention,
     create_block_mask,
 )
-from typing import Callable
+from typing import Callable, Optional, List, Tuple
+
+# flex_attention = torch.compile(flex_attention)
 
 
 def norm(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
@@ -15,7 +17,7 @@ def norm(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
 
 def create_beacon_mask(max_seq_len: int, beacon_offset: int) -> Callable:
     def create_mask(b, h, q_idx, kv_idx):
-        is_causal = q_idx <= kv_idx
+        is_causal = q_idx >= kv_idx
         is_beacon = kv_idx % beacon_offset == 0
         is_recent = kv_idx >= q_idx - beacon_offset
         return is_causal & (is_beacon | is_recent)
@@ -37,12 +39,9 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("cos", torch.cos(angles))
         self.register_buffer("sin", torch.sin(angles))
 
-    def forward(self, x: torch.Tensor, seq_index: int = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, seq_index: Optional[int] = None) -> torch.Tensor:
         if seq_index is None:
             seq_len = x.size(2)
-            assert (
-                seq_len <= self.max_seq_len
-            ), "input sequence length exceeds max_seq_len"
             cos = self.cos[:seq_len, :]
             sin = self.sin[:seq_len, :]
         else:
@@ -55,6 +54,82 @@ class RotaryEmbedding(nn.Module):
         y_even = x_odd * sin + x_even * cos
         y = torch.stack([y_odd, y_even], dim=-1)
         return y.flatten(start_dim=3).type_as(x)
+
+
+class KVCache:
+    """Convenient KV cache container for managing attention states"""
+
+    def __init__(
+        self,
+        n_layers: int,
+        n_heads: int,
+        head_dim: int,
+        max_seq_len: int,
+        device: str = "cpu",
+    ):
+        self.n_layers = n_layers
+        self.n_heads = n_heads
+        self.head_dim = head_dim
+        self.max_seq_len = max_seq_len
+        self.device = device
+        self.current_length = 0
+
+        # Pre-allocate cache tensors
+        self.keys = [
+            torch.empty(
+                1, n_heads, max_seq_len, head_dim, device=device, dtype=torch.float16
+            )
+            for _ in range(n_layers)
+        ]
+        self.values = [
+            torch.empty(
+                1, n_heads, max_seq_len, head_dim, device=device, dtype=torch.float16
+            )
+            for _ in range(n_layers)
+        ]
+
+    def update(
+        self,
+        layer_idx: int,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        position: Optional[int] = None,
+    ):
+        """Update cache with new key-value pairs"""
+        if position is None:
+            # Batch update (for prefill)
+            seq_len = k.size(2)
+            self.keys[layer_idx][:, :, :seq_len, :] = k.to(dtype=torch.float16)
+            self.values[layer_idx][:, :, :seq_len, :] = v.to(dtype=torch.float16)
+            self.current_length = seq_len
+        else:
+            # Single position update (for generation)
+            self.keys[layer_idx][:, :, position, :] = k.squeeze(2).to(
+                dtype=torch.float16
+            )
+            self.values[layer_idx][:, :, position, :] = v.squeeze(2).to(
+                dtype=torch.float16
+            )
+            if position >= self.current_length:
+                self.current_length = position + 1
+
+    def get_kv(
+        self, layer_idx: int, seq_len: Optional[int] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Get key-value pairs for a specific layer"""
+        if seq_len is None:
+            seq_len = self.current_length
+        return (
+            self.keys[layer_idx][:, :, :seq_len, :].to(dtype=torch.float32),
+            self.values[layer_idx][:, :, :seq_len, :].to(dtype=torch.float32),
+        )
+
+    def clear(self):
+        """Clear the cache"""
+        self.current_length = 0
+        for layer_idx in range(self.n_layers):
+            self.keys[layer_idx].zero_()
+            self.values[layer_idx].zero_()
 
 
 class MultiHeadAttention(nn.Module):
@@ -80,17 +155,46 @@ class MultiHeadAttention(nn.Module):
                 with torch.no_grad():
                     module.weight.uniform_(-bound, bound)
 
-    def forward(self, x: torch.Tensor, block_mask: BlockMask) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        block_mask: BlockMask,
+        kv_cache: Optional[KVCache] = None,
+        layer_idx: Optional[int] = None,
+        use_cache: bool = False,
+        position: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         B, L, _ = x.shape
         q, k, v = self.to_qkv(x).split(self.hidden_size, dim=2)
         q = q.view(B, L, self.n_head, self.head_dim).transpose(1, 2)
         k = k.view(B, L, self.n_head, self.head_dim).transpose(1, 2)
         v = v.view(B, L, self.n_head, self.head_dim).transpose(1, 2)
+
         q = norm(q)
         k = norm(k)
-        q = self.rotary_emb(q)
-        k = self.rotary_emb(k)
-        out = flex_attention(q, k, v, block_mask=block_mask)
+
+        if position is not None:
+            q = self.rotary_emb(q, seq_index=position)
+            k = self.rotary_emb(k, seq_index=position)
+        else:
+            q = self.rotary_emb(q)
+            k = self.rotary_emb(k)
+
+        # Handle KV cache
+        if use_cache and kv_cache is not None and layer_idx is not None:
+            if position is not None:
+                # Generation mode - use cached KV
+                kv_cache.update(layer_idx, k, v, position)
+                cached_k, cached_v = kv_cache.get_kv(layer_idx)
+                out = flex_attention(q, cached_k, cached_v, block_mask=block_mask)
+            else:
+                # Prefill mode - cache new KV
+                kv_cache.update(layer_idx, k, v)
+                out = flex_attention(q, k, v, block_mask=block_mask)
+        else:
+            # Standard forward without cache
+            out = flex_attention(q, k, v, block_mask=block_mask)
+
         out = out.transpose(1, 2).reshape(B, L, self.hidden_size)
         return self.out_proj(out), k, v
 
@@ -104,7 +208,6 @@ class MLP(nn.Module):
         self.init_weights()
 
     def init_weights(self):
-        # modded nanogpt init
         self.w1.weight.detach().zero_()
         self.w2.weight.detach().zero_()
 
@@ -118,8 +221,18 @@ class Block(nn.Module):
         self.attn = MultiHeadAttention(n_head, hidden_size, max_seq_len)
         self.mlp = MLP(hidden_size, 4 * hidden_size)
 
-    def forward(self, x: torch.Tensor, block_mask: BlockMask) -> torch.Tensor:
-        x_attn, k, v = self.attn(norm(x), block_mask)
+    def forward(
+        self,
+        x: torch.Tensor,
+        block_mask: BlockMask,
+        kv_cache: Optional[KVCache] = None,
+        layer_idx: Optional[int] = None,
+        use_cache: bool = False,
+        position: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        x_attn, k, v = self.attn(
+            norm(x), block_mask, kv_cache, layer_idx, use_cache, position
+        )
         x = x + x_attn
         x = x + self.mlp(norm(x))
         return x, k, v
@@ -141,7 +254,9 @@ class BeaconGPT(nn.Module):
         self.wte = nn.Embedding(vocab_size, hidden_size)
         self.n_layer = n_layer
         self.n_head = n_head
+        self.hidden_size = hidden_size
         self.head_dim = hidden_size // n_head
+        self.max_seq_len = max_seq_len
         self.dropout = nn.Dropout(dropout)
         self.blocks = nn.ModuleList(
             [Block(n_head, hidden_size, max_seq_len) for _ in range(n_layer)]
@@ -161,101 +276,168 @@ class BeaconGPT(nn.Module):
                 bound = 3**0.5 * std
                 with torch.no_grad():
                     module.weight.uniform_(-bound, bound)
-
         self.lm_head.weight.data.zero_()
 
     def forward(
         self,
         input_ids: torch.Tensor,
-        labels: torch.Tensor = None,
-        mask: BlockMask = None,
-    ) -> torch.Tensor:
+        labels: Optional[torch.Tensor] = None,
+        mask: Optional[BlockMask] = None,
+        kv_cache: Optional[KVCache] = None,
+        use_cache: bool = False,
+        position: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         assert input_ids.size(0) == 1, "Only batch size 1 is supported with flex-attn"
+
         x = self.wte(input_ids)
         x = norm(x)
-        for block in self.blocks:
-            x = x + block(x, mask)[0]
+
+        # Create default causal mask if none provided
+        if mask is None:
+            seq_len = input_ids.size(1)
+            mask = create_block_mask(
+                lambda b, h, q_idx, kv_idx: q_idx >= kv_idx,
+                B=None,
+                H=None,
+                Q_LEN=seq_len,
+                KV_LEN=seq_len if position is None else kv_cache.current_length + 1,
+                device=input_ids.device,
+            )
+
+        for i, block in enumerate(self.blocks):
+            x, _, _ = block(x, mask, kv_cache, i, use_cache, position)
+
         logits = self.lm_head(x)
 
         loss = None
         if labels is not None:
             logits = logits.float()
-            labels = F.pad(labels, (0, 1), value=-100)
-            labels = labels[:, 1:]
             loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=-100
             )
+
         return logits, loss
 
+    def create_kv_cache(self, device: str = "cpu") -> KVCache:
+        """Create a new KV cache instance"""
+        return KVCache(
+            n_layers=self.n_layer,
+            n_heads=self.n_head,
+            head_dim=self.head_dim,
+            max_seq_len=self.max_seq_len,
+            device=device,
+        )
+
+    @torch.no_grad()
     def generate(
-        self, input_ids: torch.Tensor, max_new_tokens: int = 16, device: str = "cpu"
-    ) -> torch.Tensor:
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int = 16,
+        temperature: float = 1.0,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+        do_sample: bool = False,
+    ) -> List[int]:
+        """Improved generation with proper KV caching"""
         assert input_ids.size(0) == 1, "Only batch size 1 is supported for generate"
-        promise_kv_len = input_ids.size(1) + max_new_tokens
-        c_k = [
-            torch.empty(1, self.n_head, promise_kv_len, self.head_dim, device=device)
-            for _ in range(self.n_layer)
-        ]
-        c_v = [
-            torch.empty(1, self.n_head, promise_kv_len, self.head_dim, device=device)
-            for _ in range(self.n_layer)
-        ]
-        print("pre-allocated kv cache", c_k[0].shape, c_v[0].shape)
-        generated_ids = []
-        x = self.wte(input_ids)
-        x = norm(x)
-        mask = create_block_mask(
+        device = input_ids.device
+
+        # Create KV cache
+        kv_cache = self.create_kv_cache(device=str(device))
+
+        # Prefill phase
+        seq_len = input_ids.size(1)
+        prefill_mask = create_block_mask(
             lambda b, h, q_idx, kv_idx: q_idx >= kv_idx,
             B=None,
             H=None,
-            Q_LEN=input_ids.size(1),
-            KV_LEN=input_ids.size(1),
+            Q_LEN=seq_len,
+            KV_LEN=seq_len,
             device=device,
         )
-        for i, block in enumerate(self.blocks):
-            x, k, v = block(x, mask)
-            c_k[i][:, :, : k.size(2), :] = k
-            c_v[i][:, :, : v.size(2), :] = v
 
-        seq_index = input_ids.size(1) - 1
-        mask = create_block_mask(
-            lambda b, h, q_idx, kv_idx: q_idx + seq_index >= kv_idx,
-            B=None,
-            H=None,
-            Q_LEN=1,
-            KV_LEN=promise_kv_len,
-            device=device,
+        logits, _ = self.forward(
+            input_ids, mask=prefill_mask, kv_cache=kv_cache, use_cache=True
         )
-        logits = self.lm_head(x)
-        new_token_id = torch.argmax(logits[0, 0, :], dim=-1, keepdim=True)
-        generated_ids.append(new_token_id.item())
-        for _ in range(max_new_tokens - 1):
-            x = self.wte(new_token_id.unsqueeze(1))
-            x = norm(x)
-            for i, block in enumerate(self.blocks):
-                B, L, _ = x.shape
-                q, k, v = block.attn.to_qkv(x).split(block.attn.hidden_size, dim=2)
-                q = q.view(B, L, self.n_head, self.head_dim).transpose(1, 2)
-                k = k.view(B, L, self.n_head, self.head_dim).transpose(1, 2)
-                v = v.view(B, L, self.n_head, self.head_dim).transpose(1, 2)
-                q = norm(q)
-                k = norm(k)
-                q = block.attn.rotary_emb(q, seq_index=seq_index)
-                k = block.attn.rotary_emb(k, seq_index=seq_index)
-                c_k[i][:, :, seq_index, :] = k.squeeze(2)
-                c_v[i][:, :, seq_index, :] = v.squeeze(2)
-                out = flex_attention(q, c_k[i], c_v[i], block_mask=mask)
-                out = out.transpose(1, 2).reshape(B, L, block.attn.hidden_size)
-                x = x + out
-            seq_index += 1
-            x = x + block.mlp(norm(x))
-            logits = self.lm_head(x)
-            new_token_id = torch.argmax(logits[0, 0, :], dim=-1, keepdim=True)
-            generated_ids.append(new_token_id.item())
+
+        # Sample first token
+        next_token = self._sample_token(
+            logits[:, -1:, :], temperature, top_k, top_p, do_sample
+        )
+        generated_ids = [next_token.item()]
+
+        # Generation phase
+        for step in range(max_new_tokens - 1):
+            position = kv_cache.current_length
+
+            # Create mask for single token generation
+            gen_mask = create_block_mask(
+                lambda b, h, q_idx, kv_idx: q_idx + position >= kv_idx,
+                B=None,
+                H=None,
+                Q_LEN=1,
+                KV_LEN=position + 1,
+                device=device,
+            )
+            logits, _ = self.forward(
+                next_token,
+                mask=gen_mask,
+                kv_cache=kv_cache,
+                use_cache=True,
+                position=position,
+            )
+
+            next_token = self._sample_token(
+                logits, temperature, top_k, top_p, do_sample
+            )
+            generated_ids.append(next_token.item())
+
         return generated_ids
+
+    def _sample_token(
+        self,
+        logits: torch.Tensor,
+        temperature: float,
+        top_k: Optional[int],
+        top_p: Optional[float],
+        do_sample: bool,
+    ) -> torch.Tensor:
+        """Sample next token from logits"""
+        logits = logits[:, -1, :] / temperature
+
+        if top_k is not None:
+            # Top-k filtering
+            top_k = min(top_k, logits.size(-1))
+            indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+            logits[indices_to_remove] = float("-inf")
+
+        if top_p is not None:
+            # Top-p (nucleus) filtering
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+
+            sorted_indices_to_remove = cumulative_probs > top_p
+            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[
+                ..., :-1
+            ].clone()
+            sorted_indices_to_remove[..., 0] = 0
+
+            indices_to_remove = sorted_indices_to_remove.scatter(
+                1, sorted_indices, sorted_indices_to_remove
+            )
+            logits[indices_to_remove] = float("-inf")
+
+        if do_sample:
+            probs = F.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+        else:
+            next_token = torch.argmax(logits, dim=-1, keepdim=True)
+
+        return next_token
 
 
 if __name__ == "__main__":
+    # Example usage
     model = BeaconGPT(
         vocab_size=512,
         hidden_size=128,
@@ -263,9 +445,18 @@ if __name__ == "__main__":
         n_head=4,
         max_seq_len=128,
     )
-    print(model)
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    x = torch.randint(0, 512, (1, 64))
-    print(x)
-    out = model.generate(x, max_new_tokens=16)
-    print(out)
+    # Test generation
+    x = torch.randint(0, 512, (1, 16))
+    print("Input:", x.shape)
+
+    # Generate with sampling
+    generated = model.generate(
+        x, max_new_tokens=16, temperature=0.8, do_sample=True, top_k=50
+    )
+    print("Generated tokens:", generated)
+
+    # Test KV cache directly
+    kv_cache = model.create_kv_cache()
+    print("KV cache created:", kv_cache.current_length)
