@@ -2,28 +2,28 @@
 
 # Model architecture
 vocab_size: 50257          # GPT-2 vocab size
-hidden_size: 128           # Hidden dimension
-n_layer: 2                # Number of transformer layers
-n_head: 2                 # Number of attention heads
-max_seq_len: 128          # Maximum sequence length
+hidden_size: 768           # Hidden dimension
+n_layer: 12                # Number of transformer layers
+n_head: 12                 # Number of attention heads
+max_seq_len: 2048          # Maximum sequence length
 dropout: 0.1               # Dropout probability
 
 # Training hyperparameters
-batch_size: 2              # Micro batch size (limited by flex attention)
+batch_size: 16              # Micro batch size (limited by flex attention)
 gradient_accumulation_steps: 1  # Effective batch = batch_size * grad_accum
-learning_rate: 0.0001      # Peak learning rate
-weight_decay: 0.01         # AdamW weight decay
+learning_rate: 0.0003      # Peak learning rate
+weight_decay: 0.1         # AdamW weight decay
 beta1: 0.9                 # AdamW beta1
 beta2: 0.95                # AdamW beta2
 grad_clip: 1.0             # Gradient clipping threshold
 warmup_steps: 1000         # Learning rate warmup steps
-max_steps: 10000           # Total training steps
+max_steps: 1000000           # Total training steps
 
 # Logging and checkpointing
-log_interval: 50           # Steps between logging
-eval_interval: 50         # Steps between evaluation
-save_interval: 1000        # Steps between checkpoints
-sample_interval: 50       # Steps between text generation
+log_interval: 250           # Steps between logging
+eval_interval: 1000         # Steps between evaluation
+save_interval: 10000        # Steps between checkpoints
+sample_interval: 1000       # Steps between text generation
 
 # Dataset configuration
 dataset_name: "HuggingFaceFW/fineweb"
@@ -31,7 +31,7 @@ dataset_split: "train"
 
 # System configuration
 device: "auto"             # "auto", "cuda", or "cpu"
-compile_model: false        # Use torch.compile for optimization
+compile_model: true        # Use torch.compile for optimization
 mixed_precision: true      # Use automatic mixed precision
 
 # Output paths

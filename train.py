@@ -14,8 +14,20 @@ from torch.nn.attention.flex_attention import create_block_mask
 from datasets import load_dataset
 import tiktoken
 from tqdm import tqdm
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from modeling_beacon_gpt import BeaconGPT
+import torch.distributed as dist
+
+def setup_distributed() -> tuple[int, int, int]:
+    if "RANK" not in os.environ:  # single-GPU
+        return 0, 1, 0
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    return rank, world_size, local_rank
 
 
 @dataclass
@@ -89,42 +101,53 @@ class TrainingConfig:
 class DataLoader:
     """Streaming data loader for training"""
 
-    def __init__(self, config: TrainingConfig, tokenizer):
+    def __init__(self, config: TrainingConfig, tokenizer, local_rank, world_size):
         self.config = config
         self.tokenizer = tokenizer
         self.eot_token = tokenizer._special_tokens["<|endoftext|>"]
-
+        self.local_rank = local_rank
+        self.world_size = world_size
         # Load streaming dataset
         self.dataset = load_dataset(
             config.dataset_name, streaming=True, split=config.dataset_split
         )
         self.dataset_iter = iter(self.dataset)
+        self.index = 0
 
     def get_batch(self) -> torch.Tensor:
         """Get a batch of token IDs"""
         ids = []
         while len(ids) < self.config.max_seq_len * self.config.batch_size:
+            self.index += 1
+            if self.index % self.world_size != self.local_rank:
+                continue
             try:
                 text = next(self.dataset_iter)["text"]
                 encoded = self.tokenizer.encode(text, allowed_special="all")
-                ids.extend(encoded + [self.eot_token])
+                ids.extend([self.eot_token] + encoded[:self.config.max_seq_len-1])
             except StopIteration:
                 # Reset iterator if we reach the end
                 self.dataset_iter = iter(self.dataset)
                 text = next(self.dataset_iter)["text"]
                 encoded = self.tokenizer.encode(text, allowed_special="all")
-                ids.extend(encoded + [self.eot_token])
+                ids.extend([self.eot_token] + encoded)
 
         # Truncate to max_seq_len
         ids = ids[: self.config.max_seq_len * self.config.batch_size]
+        labels = ids[1:]
+        ids = ids[:-1]
         device = self.config.resolve_device()
-        return torch.tensor([ids], dtype=torch.long, device=device)
+        return torch.tensor([ids], dtype=torch.long, device=device), torch.tensor([labels], dtype=torch.long, device=device)
 
 
 class Trainer:
     """Main trainer class"""
 
     def __init__(self, config: TrainingConfig):
+        setup_distributed()
+        self.local_rank = dist.get_rank()
+        self.world_size = dist.get_world_size()
+        print(f"local_rank: {self.local_rank}, world_size: {self.world_size}")
         self.config = config
         self.step = 0
 
@@ -159,6 +182,7 @@ class Trainer:
 
         # Move to device
         self.model.to(self.device)
+        self.model = DDP(self.model, device_ids=[self.local_rank])
 
         # Compile model if requested
         if config.compile_model:
@@ -177,14 +201,14 @@ class Trainer:
         self.scheduler = self._get_scheduler()
 
         # Initialize data loader
-        self.data_loader = DataLoader(config, self.tokenizer)
+        self.data_loader = DataLoader(config, self.tokenizer, self.local_rank, self.world_size)
 
         # Initialize logging
         self.writer = SummaryWriter(log_dir=config.log_dir)
 
         # Mixed precision scaler
         self.scaler = (
-            torch.cuda.amp.GradScaler()
+            torch.amp.GradScaler()
             if config.mixed_precision and self.device == "cuda"
             else None
         )
@@ -233,7 +257,7 @@ class Trainer:
             device=self.device,
         )
 
-    def train_step(self, input_ids: torch.Tensor) -> Dict[str, float]:
+    def train_step(self, input_ids: torch.Tensor, labels: torch.Tensor) -> Dict[str, float]:
         """Single training step"""
         t0 = time.time()
         mask = self._create_document_mask(input_ids)
@@ -241,10 +265,10 @@ class Trainer:
         mask_time = t1 - t0
 
         # Prepare labels (shifted input for next token prediction)
-        labels = input_ids.clone()
+        # labels = input_ids.clone()
 
         if self.config.mixed_precision and self.scaler is not None:
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast(device_type=self.device):
                 logits, loss = self.model(input_ids, labels=labels, mask=mask)
 
             # Scale loss for gradient accumulation
@@ -265,12 +289,9 @@ class Trainer:
         """Generate a sample from the model"""
         self.model.eval()
         with torch.no_grad():
-            generated_tokens = self.model.generate(
+            generated_tokens = self.model.module.generate(
                 self.test_prompt_ids,
-                max_new_tokens=32,
-                temperature=0.8,
-                top_k=50,
-                do_sample=True,
+                do_sample=False,
             )
             generated_text = self.test_prompt + self.tokenizer.decode(generated_tokens)
         self.model.train()
@@ -330,12 +351,15 @@ class Trainer:
         # Progress bar
         pbar = tqdm(total=self.config.max_steps, initial=self.step, desc="Training")
 
+        total_tokens = 0
+
         while self.step < self.config.max_steps:
             # Get batch
-            input_ids = self.data_loader.get_batch()
+            input_ids, labels = self.data_loader.get_batch()
+            total_tokens += input_ids.shape[1]
 
             # Training step
-            metrics = self.train_step(input_ids)
+            metrics = self.train_step(input_ids, labels)
             accumulated_loss += metrics["loss"]
 
             # Update weights every gradient_accumulation_steps
@@ -359,7 +383,7 @@ class Trainer:
                 self.scheduler.step()
 
             # Logging
-            if self.step % self.config.log_interval == 0:
+            if self.step % self.config.log_interval == 0 and self.local_rank == 0:
                 avg_loss = accumulated_loss / self.config.log_interval
                 elapsed_time = time.time() - start_time
                 tokens_per_sec = (
@@ -368,7 +392,7 @@ class Trainer:
 
                 print(
                     f"Step {self.step}: loss={avg_loss:.4f}, lr={metrics['lr']:.2e}, "
-                    f"tok/s={tokens_per_sec:.0f}, mask_time={metrics['mask_time']:.4f}, input_shape={input_ids.shape}"
+                    f"tok/s={tokens_per_sec:.0f}, mask_time={metrics['mask_time']:.4f}, input_shape={input_ids.shape}, total_tokens={total_tokens}"
                 )
 
                 # Log to tensorboard
@@ -382,13 +406,13 @@ class Trainer:
                 start_time = time.time()
 
             # Generate samples
-            if self.step % self.config.sample_interval == 0 and self.step > 0:
+            if self.step % self.config.sample_interval == 0 and self.step > 0 and self.local_rank == 0:
                 sample_text = self.generate_sample()
                 print(f"Sample: {sample_text}")
                 self.writer.add_text("samples/generated", sample_text, self.step)
 
             # Save checkpoint
-            if self.step % self.config.save_interval == 0 and self.step > 0:
+            if self.step % self.config.save_interval == 0 and self.step > 0 and self.local_rank == 0:
                 self.save_checkpoint(self.step)
 
             self.step += 1
