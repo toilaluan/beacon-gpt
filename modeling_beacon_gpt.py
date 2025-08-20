@@ -25,8 +25,11 @@ def create_beacon_mask(max_seq_len: int, beacon_offset: int) -> Callable:
     return create_mask
 
 
+def next_multiple_of_n(v: float | int, *, n: int):
+    return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
+
 class RotaryEmbedding(nn.Module):
-    def __init__(self, head_dim: int, base: int = 10000, max_seq_len: int = 2048):
+    def __init__(self, head_dim: int, base: int = 1024, max_seq_len: int = 2048):
         super().__init__()
         self.head_dim = head_dim
         self.base = base
@@ -140,7 +143,7 @@ class MultiHeadAttention(nn.Module):
         assert hidden_size % n_head == 0, "hidden_size must be divisible by n_head"
         self.head_dim = hidden_size // n_head
         self.rotary_emb = RotaryEmbedding(
-            head_dim=self.head_dim, max_seq_len=max_seq_len
+            head_dim=self.head_dim, max_seq_len=max_seq_len, base=10000
         )
         self.to_qkv = nn.Linear(hidden_size, 3 * hidden_size, bias=False)
         self.out_proj = nn.Linear(hidden_size, hidden_size, bias=False)
@@ -154,6 +157,7 @@ class MultiHeadAttention(nn.Module):
                 bound = 3**0.5 * std
                 with torch.no_grad():
                     module.weight.uniform_(-bound, bound)
+        self.out_proj.weight.data.zero_()
 
     def forward(
         self,
@@ -204,15 +208,13 @@ class MLP(nn.Module):
         super().__init__()
         self.w1 = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.w2 = nn.Linear(intermediate_size, hidden_size, bias=False)
-        self.act = nn.GELU()
         self.init_weights()
 
     def init_weights(self):
-        self.w1.weight.detach().zero_()
         self.w2.weight.detach().zero_()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.w2(self.act(self.w1(x)))
+        return self.w2(F.relu(self.w1(x)).square())
 
 
 class Block(nn.Module):
@@ -246,18 +248,17 @@ class BeaconGPT(nn.Module):
         n_layer: int,
         n_head: int,
         max_seq_len: int,
-        dropout: float = 0.1,
         use_beacon: bool = False,
         beacon_offset: int = 16,
     ):
         super().__init__()
+        vocab_size = next_multiple_of_n(vocab_size, n=16)
         self.wte = nn.Embedding(vocab_size, hidden_size)
         self.n_layer = n_layer
         self.n_head = n_head
         self.hidden_size = hidden_size
         self.head_dim = hidden_size // n_head
         self.max_seq_len = max_seq_len
-        self.dropout = nn.Dropout(dropout)
         self.blocks = nn.ModuleList(
             [Block(n_head, hidden_size, max_seq_len) for _ in range(n_layer)]
         )
@@ -307,11 +308,10 @@ class BeaconGPT(nn.Module):
         for i, block in enumerate(self.blocks):
             x, _, _ = block(x, mask, kv_cache, i, use_cache, position)
 
-        logits = self.lm_head(x)
-
+        x = norm(x)
+        logits = self.lm_head(x).float()
         loss = None
         if labels is not None:
-            logits = logits.float()
             loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=-100
             )
