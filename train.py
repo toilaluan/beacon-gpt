@@ -6,6 +6,8 @@ import yaml
 from typing import Optional, Dict, Any
 from pathlib import Path
 from dataclasses import dataclass, asdict
+from muon import MuonWithAuxAdam
+
 
 import torch
 import torch.nn as nn
@@ -65,7 +67,7 @@ class TrainingConfig:
     sample_interval: int = 500
 
     # Data config
-    dataset_bin_pattern: str = "./data/*train*.bin"
+    dataset_bin_pattern: str = "./data/fineweb10B/*train*.bin"
 
     # System config
     device: str = "auto"  # "auto", "cuda", "cpu"
@@ -100,75 +102,60 @@ class TrainingConfig:
         return self.device
 
 
-class DataLoader:
-    """Streaming data loader for training"""
+def _load_data_shard(file: Path):
+    t0 = time.time()
+    header = torch.from_file(str(file), False, 256, dtype=torch.int32) # header is 256 int32
+    assert header[0] == 20240520, "magic number mismatch in the data .bin file"
+    assert header[1] == 1, "unsupported version"
+    num_tokens = int(header[2]) # number of tokens (claimed)
+    with file.open("rb", buffering=0) as f:
+        tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True) # avoid pin_memory copy by @YouJiacheng
+        f.seek(256 * 4)
+        nbytes = f.readinto(tokens.numpy()) # avoid bytes->array copy by @YouJiacheng
+        assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
+    print(f"load data shard takes", time.time() - t0)
+    return tokens
 
-    def __init__(self, config: TrainingConfig, tokenizer, local_rank, world_size):
-        self.config = config
-        self.tokenizer = tokenizer
-        self.eot_token = tokenizer._special_tokens["<|endoftext|>"]
-        self.local_rank = local_rank
-        self.world_size = world_size
-        # Load streaming dataset
-        self.bin_files = [Path(file) for file in glob.glob(config.dataset_bin_pattern)]
-        self.bin_files_iter = iter(self.bin_files)
-        self.max_seq_len = config.max_seq_len * config.batch_size
-        self.dataset_iter = self._gen_valid_sentence_ids()
+# find world_size starting indicies, such that each begins with token 50256 and local_batches don't overlap
+def find_batch_starts(tokens: torch.Tensor, pos: int, local_batch_size: int, max_batch_span: int):
+    boundary_mask = tokens[pos : pos + max_batch_span] == 50256
+    boundary_positions = torch.nonzero(boundary_mask, as_tuple=False).squeeze(-1) + pos
+    start = boundary_positions[0].item()
+    starts = []
+    for i in range(1, len(boundary_positions)):
+        end = boundary_positions[i].item() 
+        if end - start >= local_batch_size:
+            starts.append(start) # append start once end pos is confirmed
+            if len(starts) == dist.get_world_size():
+                return starts, end - pos
+            start = end
+    assert False # increase max_batch_span if necessary
 
-    def _load_data_shard(self,file: Path):
-        header = torch.from_file(str(file), False, 256, dtype=torch.int32) # header is 256 int32
-        assert header[0] == 20240520, "magic number mismatch in the data .bin file"
-        assert header[1] == 1, "unsupported version"
-        num_tokens = int(header[2]) # number of tokens (claimed)
-        with file.open("rb", buffering=0) as f:
-            tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True) # avoid pin_memory copy by @YouJiacheng
-            f.seek(256 * 4)
-            nbytes = f.readinto(tokens.numpy()) # avoid bytes->array copy by @YouJiacheng
-            assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
-        return tokens
-
-    def _gen_valid_sentence_ids(self) -> torch.Tensor:
-        for bin_file in self.bin_files_iter:
-            tokens = self._load_data_shard(bin_file)
-            tokens_per_rank = tokens.shape[0] // self.world_size
-            rank_start = tokens_per_rank * self.local_rank
-            rank_end = rank_start + tokens_per_rank
-            valid_sentence_ids = tokens[rank_start:rank_end]
-            
-            index = 0
-            while index < valid_sentence_ids.shape[0]:
-                # Look for EOT token in current window
-                segment = valid_sentence_ids[index:index+self.max_seq_len]
-                eot_token_idx = (segment == self.eot_token).nonzero(as_tuple=True)[0]
-                
-                if len(eot_token_idx) == 0:
-                    # No EOT token found in this segment, skip ahead
-                    index += self.max_seq_len
-                    continue
-                
-                # Start from the first EOT token found
-                eot_start = index + eot_token_idx[0].item()
-                eot_end = min(eot_start + self.max_seq_len, valid_sentence_ids.shape[0])
-                
-                segment = valid_sentence_ids[eot_start:eot_end]
-                
-                # Only yield if we have a full sequence or this is the last possible segment
-                if segment.shape[0] == self.max_seq_len or eot_end == valid_sentence_ids.shape[0]:
-                    yield segment
-                
-                index = eot_start + self.max_seq_len
-
-    def get_batch(self) -> torch.Tensor:
-        """Get a batch of token IDs"""
+def distributed_data_generator(filename_pattern: str, batch_size: int, align_to_bos: bool):
+    print("batch_size", batch_size)
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    files = [Path(file) for file in sorted(glob.glob(filename_pattern))]
+    assert batch_size % world_size == 0
+    local_batch_size = batch_size // world_size
+    file_iter = iter(files) # use itertools.cycle(files) instead if you want to do multi-epoch training
+    tokens, pos = _load_data_shard(next(file_iter)), 0
+    max_batch_span = 2 * batch_size if align_to_bos else batch_size # provide buffer to handle samples up to length local_batch_size
+    while True:
         t0 = time.time()
-        ids = next(self.dataset_iter)
-        labels = ids[1:].clone()
-        ids = ids[:-1].clone()
-        device = self.config.resolve_device()
-        ids = ids.to(dtype=torch.int32, device=device, non_blocking=True)
-        labels = labels.to(dtype=torch.int64, device=device, non_blocking=True)
-        t1 = time.time()
-        return ids, labels, t1 - t0
+        if pos + max_batch_span + 1 >= len(tokens):
+            tokens, pos = _load_data_shard(next(file_iter)), 0
+        if align_to_bos:
+            batch_starts, batch_span = find_batch_starts(tokens, pos, local_batch_size, max_batch_span)
+            start_idx = batch_starts[rank]
+        else:
+            batch_span = batch_size
+            start_idx = pos + rank * local_batch_size
+        buf = tokens[start_idx:][:local_batch_size + 1]
+        inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True) # no sync on host side;
+        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True) # H2D in another stream isn't helpful.
+        pos += batch_span
+        yield inputs, targets, time.time() - t0
 
 
 class Trainer:
@@ -218,26 +205,34 @@ class Trainer:
         self.model.to(self.device)
         for param in self.model.parameters():
             dist.broadcast(param.detach(), 0)
-        self.model = DDP(self.model, device_ids=[self.local_rank])
+        hidden_weights = [p for p in self.model.blocks.parameters() if p.ndim >= 2]
+        non_hidden_weights = [*self.model.lm_head.parameters(), *self.model.wte.parameters()]
+        param_groups = [
+            dict(params=non_hidden_weights, lr=self.config.learning_rate, betas=(0.9,0.95), weight_decay=0.01, use_muon=False),
+            dict(params=hidden_weights, lr=0.02, weight_decay=0.01, use_muon=True),
+        ]
+        self.optimizer = MuonWithAuxAdam(param_groups)
 
         # Compile model if requested
         if config.compile_model:
             print("Compiling model...")
-            self.model = torch.compile(self.model)
+            self.model = torch.compile(self.model, dynamic=False)
 
-        # Initialize optimizer and scheduler
-        self.optimizer = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=config.learning_rate,
-            betas=(config.beta1, config.beta2),
-            weight_decay=config.weight_decay,
-        )
+
+        self.model = DDP(self.model, device_ids=[self.local_rank])
+        # # Initialize optimizer and scheduler
+        # self.optimizer = torch.optim.AdamW(
+        #     self.model.parameters(),
+        #     lr=config.learning_rate,
+        #     betas=(config.beta1, config.beta2),
+        #     weight_decay=config.weight_decay,
+        # )
 
         # Learning rate scheduler with warmup
         self.scheduler = self._get_scheduler()
 
         # Initialize data loader
-        self.data_loader = DataLoader(config, self.tokenizer, self.local_rank, self.world_size)
+        self.data_loader = distributed_data_generator(config.dataset_bin_pattern, config.batch_size * config.max_seq_len * self.world_size, align_to_bos=True)
 
         # Initialize logging
         self.writer = SummaryWriter(log_dir=config.log_dir)
@@ -261,14 +256,13 @@ class Trainer:
         """Get learning rate scheduler with warmup"""
 
         def lr_lambda(step):
-            if step < self.config.warmup_steps:
-                return step / self.config.warmup_steps
+            x = step / self.config.max_steps
+            assert 0 <= x < 1
+            if x < 1 - 0.45:
+                return 1.0
             else:
-                # Cosine decay after warmup
-                progress = (step - self.config.warmup_steps) / (
-                    self.config.max_steps - self.config.warmup_steps
-                )
-                return 0.5 * (1 + math.cos(math.pi * progress))
+                w = (1 - x) / 0.45
+                return w * 1.0 + (1 - w) * 0.1
 
         return torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
 
@@ -303,17 +297,12 @@ class Trainer:
         # Prepare labels (shifted input for next token prediction)
         # labels = input_ids.clone()
         t0 = time.time()
-        if self.config.mixed_precision and self.scaler is not None:
-            with torch.amp.autocast(device_type=self.device):
-                logits, loss = self.model(input_ids, labels=labels, mask=mask)
-
-            # Scale loss for gradient accumulation
-            loss = loss / self.config.gradient_accumulation_steps
-            self.scaler.scale(loss).backward()
-        else:
+        with torch.amp.autocast(device_type=self.device):
             logits, loss = self.model(input_ids, labels=labels, mask=mask)
-            loss = loss / self.config.gradient_accumulation_steps
-            loss.backward()
+
+        # Scale loss for gradient accumulation
+        loss = loss / self.config.gradient_accumulation_steps
+        self.scaler.scale(loss).backward()
         t1 = time.time()
         loss_time = t1 - t0
         return {
@@ -380,6 +369,7 @@ class Trainer:
         print(f"  Max sequence length: {self.config.max_seq_len}")
         print(f"  Device: {self.device}")
         print()
+        total_time = 0.0
 
         self.model.train()
 
@@ -387,13 +377,16 @@ class Trainer:
         start_time = time.time()
 
         # Progress bar
-        pbar = tqdm(total=self.config.max_steps, initial=self.step, desc="Training")
+        # pbar = tqdm(total=self.config.max_steps, initial=self.step, desc="Training")
+
+        scaler = torch.amp.GradScaler()
 
         total_tokens = 0
 
         while self.step < self.config.max_steps:
             # Get batch
-            input_ids, labels, token_time = self.data_loader.get_batch()
+            t0 = time.time()
+            input_ids, labels, token_time = next(self.data_loader)
             input_ids = input_ids.unsqueeze(0)
             labels = labels.unsqueeze(0)
             total_tokens += input_ids.shape[1]
@@ -401,27 +394,12 @@ class Trainer:
             # Training step
             metrics = self.train_step(input_ids, labels)
             accumulated_loss += metrics["loss"]
-
-            # Update weights every gradient_accumulation_steps
-            if (self.step + 1) % self.config.gradient_accumulation_steps == 0:
-                if self.scaler is not None:
-                    # Gradient clipping with mixed precision
-                    self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(), self.config.grad_clip
-                    )
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                else:
-                    # Regular gradient clipping
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(), self.config.grad_clip
-                    )
-                    self.optimizer.step()
-
-                self.optimizer.zero_grad()
-                self.scheduler.step()
-
+            scaler.step(self.optimizer)
+            scaler.update()
+            self.optimizer.zero_grad()
+            self.scheduler.step()
+            t1 = time.time()
+            total_time += t1 - t0
             # Logging
             if self.step % self.config.log_interval == 0 and self.local_rank == 0:
                 avg_loss = accumulated_loss / self.config.log_interval
@@ -432,8 +410,10 @@ class Trainer:
 
                 print(
                     f"Step {self.step}: loss={avg_loss:.4f}, lr={metrics['lr']:.2e}, "
-                    f"tok/s={tokens_per_sec:.0f}, mask_time={metrics['mask_time']:.4f}, loss_time={metrics['loss_time']:.4f}, input_shape={input_ids.shape}, total_tokens={total_tokens}, token_time={token_time:.4f}"
+                    f"tok/s={tokens_per_sec:.0f}, mask_time={metrics['mask_time']:.4f}"
                 )
+                print(f"loss_time={metrics['loss_time']:.4f}, input_shape={input_ids.shape}, total_tokens={total_tokens}, token_time={token_time:.4f}, step_time={t1 - t0:.4f}")
+                print(f"total_time={total_time:.4f}")
                 wandb.log({
                     "train/loss": avg_loss,
                     "train/learning_rate": metrics["lr"],
@@ -460,9 +440,9 @@ class Trainer:
                 self.save_checkpoint(self.step)
 
             self.step += 1
-            pbar.update(1)
+            # pbar.update(1)
 
-        pbar.close()
+        # pbar.close()
         print("Training completed!")
 
         # Final checkpoint

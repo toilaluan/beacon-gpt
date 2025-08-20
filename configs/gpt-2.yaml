@@ -4,12 +4,12 @@
 vocab_size: 50257          # GPT-2 vocab size
 hidden_size: 768           # Hidden dimension
 n_layer: 12                # Number of transformer layers
-n_head: 12                 # Number of attention heads
+n_head: 6                 # Number of attention heads
 max_seq_len: 1024          # Maximum sequence length
 dropout: 0.1               # Dropout probability
 
 # Training hyperparameters
-batch_size: 16              # Micro batch size (limited by flex attention)
+batch_size: 48              # Micro batch size (limited by flex attention)
 gradient_accumulation_steps: 1  # Effective batch = batch_size * grad_accum
 learning_rate: 0.0003      # Peak learning rate
 weight_decay: 0.1         # AdamW weight decay
@@ -17,10 +17,10 @@ beta1: 0.9                 # AdamW beta1
 beta2: 0.95                # AdamW beta2
 grad_clip: 1.0             # Gradient clipping threshold
 warmup_steps: 1000         # Learning rate warmup steps
-max_steps: 1000000           # Total training steps
+max_steps: 1750           # Total training steps
 
 # Logging and checkpointing
-log_interval: 50           # Steps between logging
+log_interval: 25           # Steps between logging
 eval_interval: 1000         # Steps between evaluation
 save_interval: 10000        # Steps between checkpoints
 sample_interval: 1000       # Steps between text generation

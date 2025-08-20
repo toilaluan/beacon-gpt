@@ -1,8 +1,8 @@
-batch_size: 16
+batch_size: 48
 beta1: 0.9
 beta2: 0.95
 compile_model: true
-dataset_bin_pattern: ./data/*train*.bin
+dataset_bin_pattern: ./data/fineweb10B/*train*.bin
 device: auto
 dropout: 0.1
 eval_interval: 1000
@@ -11,11 +11,11 @@ gradient_accumulation_steps: 1
 hidden_size: 768
 learning_rate: 0.0003
 log_dir: ./logs
-log_interval: 50
+log_interval: 25
 max_seq_len: 1024
-max_steps: 1000000
+max_steps: 1750
 mixed_precision: true
-n_head: 12
+n_head: 6
 n_layer: 12
 output_dir: ./checkpoints
 sample_interval: 1000
