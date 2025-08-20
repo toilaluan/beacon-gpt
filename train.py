@@ -14,6 +14,9 @@ from loguru import logger
 import uuid
 from muon import MuonWithAuxAdam
 from torch.nn.parallel import DistributedDataParallel as DDP
+from visualize_mask import visualize_attention_scores
+from torch.profiler import profile, ProfilerActivity, record_function
+
 
 log_uuid = str(uuid.uuid4())
 
@@ -161,6 +164,8 @@ def distributed_data_generator(
             # 5. Reconstruct the buffer if any new parts were created.
             if new_buf_parts:
                 buf = torch.cat(new_buf_parts)
+                buf = buf[:local_batch_size]
+
 
         inputs = buf[:-1].to(
             device="cuda", dtype=torch.int32, non_blocking=True
@@ -176,7 +181,7 @@ def distributed_data_generator(
 local_batch_size = 48 * 1024
 
 train_loader = distributed_data_generator(
-    "data/fineweb10B/*train*.bin", local_batch_size * WORLD_SIZE, True, False
+    "data/fineweb10B/*train*.bin", local_batch_size * WORLD_SIZE, True, use_beacon
 )
 
 sample = next(train_loader)
@@ -186,6 +191,7 @@ log_main(f"Train loader sample: inputs {sample[0].shape}, targets {sample[1].sha
 log_main(
     f"Running with pytorch version {torch.__version__} compiled for CUDA {torch.version.cuda}"
 )
+
 
 
 def nvidia_smi():
@@ -249,17 +255,10 @@ def get_lr(step: int):
         return w * 1.0 + (1 - w) * 0.1
 
 scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: get_lr(step))
-
-model = DDP(model, device_ids=[LOCAL_RANK])
-model: nn.Module = torch.compile(model, dynamic=False)
-
-
-model.train()
-
-
 def get_masking_rule(input_seq: torch.Tensor):
-    docs = (input_seq == end_of_document_token_id)[0].cumsum(0)
-    beacons = (input_seq == beacon_token_id)[0]
+    docs = (input_seq == end_of_document_token_id).cumsum(0)
+    is_beacons = (input_seq == beacon_token_id)[0]
+    beacons = 1 + is_beacons.cumsum(0) - is_beacons.long()
 
     def document_causal(b, h, q_idx, kv_idx):
         causal_mask = q_idx >= kv_idx
@@ -268,51 +267,86 @@ def get_masking_rule(input_seq: torch.Tensor):
 
     def document_causal_beacon(b, h, q_idx, kv_idx):
         causal_mask = q_idx >= kv_idx
-        is_beacon = beacons[kv_idx]
-        is_recent = kv_idx >= q_idx - beacon_offset
-        return causal_mask & (is_beacon | is_recent)
+        is_beacon = is_beacons[kv_idx]
+        is_same_beacon_part = beacons[q_idx] == beacons[kv_idx]
+        return causal_mask & (is_beacon | is_same_beacon_part)
 
     if use_beacon:
         return document_causal_beacon
     else:
         return document_causal
 
+if RANK == 0:
+    log_main("Visualizing mask")
+    sample_input = sample[0][:2048].unsqueeze(0)
+    log_main(f"Sample input: {sample_input.shape}")
+    sample_length = sample_input.size(1)
+    dump_q = torch.ones(1, 1, sample_length, 8, device="cuda")
+    dump_k = torch.ones(1, 1, sample_length, 8, device="cuda")
+    dump_v = torch.ones(1, 1, sample_length, 8, device="cuda")
+    dump_mask =get_masking_rule(sample_input)
+    visualize_attention_scores(dump_q, dump_k, mask_mod=dump_mask, device="cuda", name=f"mask_visualize_{use_beacon}_beacon")
+
+model = DDP(model, device_ids=[LOCAL_RANK])
+model: nn.Module = torch.compile(model, dynamic=False)
+
+
+model.train()
+
 
 scaler = torch.amp.GradScaler()
 
 train_time_ms = 0.0
 
-for step in range(num_train_steps):
-    torch.cuda.synchronize()  # Ensure previous operations are complete
-    t0 = time.perf_counter()  # Start timing for this step
-    
-    inputs, targets = next(train_loader)
-    inputs = inputs[None, :]
-    targets = targets[None, :]
-    masking_rule = get_masking_rule(inputs)
-    mask = create_block_mask(
-        masking_rule,
-        B=None,
-        H=None,
-        Q_LEN=inputs.size(1),
-        KV_LEN=inputs.size(1),
-        device=inputs.device,
-    )
-    with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-        logits, loss = model(inputs, targets, mask)
-    scaler.scale(loss).backward()
-    
-    # Learning rate scheduling
-    scaler.step(optimizer)
-    scaler.update()
-    scheduler.step()
-    model.zero_grad(set_to_none=True)
-    
-    torch.cuda.synchronize()  # Ensure all operations are complete
-    if step >= 10:
-        step_time_ms = (time.perf_counter() - t0) * 1000
-        train_time_ms += step_time_ms
-        current_lr = scheduler.get_last_lr()
-        log_main(
-            f"[step {step}] loss {loss.item():.4f} / step_time {step_time_ms:.2f}ms / avg_time {train_time_ms / (step + 1):.2f}ms / lr {current_lr}"
+with torch.profiler.profile(
+        schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=2),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler('./log/resnet18'),
+        with_stack=True
+    ) as prof:
+
+    for step in range(num_train_steps):
+        torch.cuda.synchronize()  # Ensure previous operations are complete
+        t0 = time.perf_counter()  # Start timing for this step
+        
+        tl_t0 = time.perf_counter()
+        inputs, targets = next(train_loader)
+        torch.cuda.synchronize()
+        tl_t1 = time.perf_counter()
+        log_main(f"Train loader time: {tl_t1 - tl_t0:.2f}ms")
+        inputs = inputs[None, :]
+        targets = targets[None, :]
+        masking_rule = get_masking_rule(inputs)
+        t_mask_0 = time.perf_counter()
+        mask = create_block_mask(
+            masking_rule,
+            B=None,
+            H=None,
+            Q_LEN=inputs.size(1),
+            KV_LEN=inputs.size(1),
+            device=inputs.device,
+            _compile=False
         )
+        torch.cuda.synchronize()
+        mask_time_ms = (time.perf_counter() - t_mask_0) * 1000
+        log_main(f"Mask time: {mask_time_ms:.2f}ms")
+        with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+            logits, loss = model(inputs, targets, mask)
+        scaler.scale(loss).backward()
+        
+        # Learning rate scheduling
+        scaler.step(optimizer)
+        scaler.update()
+        scheduler.step()
+        prof.step()
+        model.zero_grad(set_to_none=True)
+        
+        torch.cuda.synchronize()  # Ensure all operations are complete
+        if step >= 10:
+            step_time_ms = (time.perf_counter() - t0) * 1000
+            train_time_ms += step_time_ms
+            current_lr = scheduler.get_last_lr()
+            log_main(
+                f"[step {step}] loss {loss.item():.4f} / step_time {step_time_ms:.2f}ms / avg_time {train_time_ms / (step + 1):.2f}ms / lr {current_lr}"
+            )
+        if (step+5) % 100 == 0:
+            log_main(prof.key_averages().table(sort_by="self_cpu_memory_usage", row_limit=10))

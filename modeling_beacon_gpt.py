@@ -8,7 +8,7 @@ from torch.nn.attention.flex_attention import (
 )
 from typing import Callable, Optional, List, Tuple
 
-# flex_attention = torch.compile(flex_attention)
+flex_attention = torch.compile(flex_attention)
 
 
 def norm(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
@@ -33,12 +33,12 @@ class RotaryEmbedding(nn.Module):
         super().__init__()
         self.head_dim = head_dim
         self.base = base
-        self.max_seq_len = max_seq_len
+        self.max_seq_len = int(max_seq_len*1.5)
 
         inv_freq = 1.0 / (
             self.base ** (torch.arange(0, head_dim, 2).float() / head_dim)
         )
-        angles = torch.outer(torch.arange(max_seq_len), inv_freq)
+        angles = torch.outer(torch.arange(self.max_seq_len), inv_freq)
         self.register_buffer("cos", torch.cos(angles))
         self.register_buffer("sin", torch.sin(angles))
 
@@ -354,6 +354,7 @@ class BeaconGPT(nn.Module):
             Q_LEN=seq_len,
             KV_LEN=seq_len,
             device=device,
+            _compile=True
         )
 
         logits, _ = self.forward(
