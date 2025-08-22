@@ -42,7 +42,11 @@ def create_score_mod(
     n = torch.arange(0, N, device=device)
 
     scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale
-    type = _ModificationType.SCORE_MOD if score_mod is not None else _ModificationType.MASK_MOD
+    type = (
+        _ModificationType.SCORE_MOD
+        if score_mod is not None
+        else _ModificationType.MASK_MOD
+    )
     if _compile:
         ctx = nullcontext()
     else:
@@ -131,7 +135,9 @@ def visualize_attention_scores(
         # Apply mask by setting masked positions to -inf
         scores_viz = torch.where(mask_viz == 0, float("-inf"), scores_viz)
 
-    suffix_title = f"Batch {batch_idx}, Head {head_idx}" if batch_idx != 0 or head_idx != 0 else ""
+    suffix_title = (
+        f"Batch {batch_idx}, Head {head_idx}" if batch_idx != 0 or head_idx != 0 else ""
+    )
 
     fig, ax = plt.subplots(figsize=(12, 10))
     color = "viridis" if score_mod is not None else "cividis"
@@ -141,7 +147,9 @@ def visualize_attention_scores(
     fig.colorbar(im)
 
     title = _name_to_title(name)
-    file_path = Path(name).with_suffix(".png") if path is None else path.with_suffix(".png")
+    file_path = (
+        Path(name).with_suffix(".png") if path is None else path.with_suffix(".png")
+    )
     ax.set_title(f"{title}\n{suffix_title}", fontsize=20)
 
     ax.set_xlabel("Key Tokens", fontsize=18)
@@ -234,7 +242,9 @@ def plot_attention_scores(
         # Apply mask by setting masked positions to -inf
         scores_viz = torch.where(mask_viz == 0, float("-inf"), scores_viz)
 
-    suffix_title = f"Batch {batch_idx}, Head {head_idx}" if batch_idx != 0 or head_idx != 0 else ""
+    suffix_title = (
+        f"Batch {batch_idx}, Head {head_idx}" if batch_idx != 0 or head_idx != 0 else ""
+    )
 
     fig, ax = plt.subplots(figsize=figsize)
     color = "viridis" if score_mod is not None else "cividis"
