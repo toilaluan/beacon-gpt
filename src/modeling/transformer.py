@@ -504,6 +504,8 @@ class Transformer(nn.Module):
 
 
 if __name__ == "__main__":
+    import time
+
     model = Transformer(
         vocab_size=100,
         n_head=4,
@@ -531,6 +533,14 @@ if __name__ == "__main__":
     input_ids = torch.tensor(
         [23, 1, 2, 2, 24, 2, 1, 3, 5, 24, 2, 2], device=input_ids.device
     )
-    print(reduce_beacon_ids_decoding(input_ids, 24))
-    output = model.generate(input_ids, max_new_tokens=10, is_beacon=True)
+    start = time.time()
+    output = model.generate(input_ids, max_new_tokens=256, is_beacon=False)
     print(output)
+    print(f"Causal time taken: {time.time() - start} seconds")
+
+    start = time.time()
+    output = model.generate(input_ids, max_new_tokens=256, is_beacon=True)
+    print(output)
+    print(f"Beacon time taken: {time.time() - start} seconds")
+
+    # ! Beacon is faster
