@@ -1,12 +1,13 @@
 import tiktoken
-from src.modeling.transformer import Transformer
+from src.modeling.transformer import Transformer, next_multiple_of_n, create_block_mask
 from src.data.dist_dataloader import distributed_data_generator
 from src.data.beacon_injecting import inject_beacon_to_docs
+from src.optimizer.muon import DistAdam, Muon
 import torch
-import wandb
 import torch.distributed as dist
 import os
 from loguru import logger
+import time
 
 # Distributed Init
 
@@ -23,15 +24,118 @@ def log_master(message):
         logger.info(message)
 
 
+def get_const_then_linear_decay_lr(
+    step: int, max_steps: int, decaying_ratio: float = 0.45, min_lr: float = 0.1
+):
+    x = step / max_steps
+    if x < 1 - decaying_ratio:
+        return 1.0
+    else:
+        w = (1 - x) / decaying_ratio
+        return 1.0 * w + (1 - w) * min_lr
+
+
 TRAIN_DATA_PATTERN = "data/fineweb10B/fineweb_train_%06d.bin"
 VAL_DATA_PATTERN = "data/fineweb10B/fineweb_val_%06d.bin"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE = 48 * 1024
-
-
 TOKENIZER = tiktoken.get_encoding("gpt2")
-
 TOKENIZER._special_tokens = {}
-
-train_loader = distributed_data_generator(
+TRAIN_LOADER = distributed_data_generator(
     TRAIN_DATA_PATTERN, batch_size=BATCH_SIZE * WORLD_SIZE, align_to_bos=True
 )
+SAMPLE_TEXT = "Hello, i am "
+SAMPLE_TEXT_IDS = TOKENIZER.encode(SAMPLE_TEXT)
+SAMPLE_TEXT_IDS = torch.tensor(SAMPLE_TEXT_IDS, dtype=torch.int32)
+USE_BEACON = True
+BEACON_STRIDE = 16
+BOS_ID = 50256
+BEACON_ID = 50257
+VOCAB_SIZE = next_multiple_of_n(TOKENIZER.n_vocab, n=16)
+MAX_STEPS = 5000
+DECAYING_RATIO = 0.45
+MIN_LR = 0.1
+SAMPLE_EVERY_N_STEPS = 100
+
+if USE_BEACON:
+    SAMPLE_TEXT_IDS = inject_beacon_to_docs(
+        SAMPLE_TEXT_IDS, bos_id=BOS_ID, beacon_id=BEACON_ID, stride=BEACON_STRIDE
+    )
+log_master(f"Sample text: {SAMPLE_TEXT}")
+log_master(f"Sample text ids: {SAMPLE_TEXT_IDS}")
+log_master(f"Vocab size: {VOCAB_SIZE}")
+log_master(f"Beacon id: {BEACON_ID}")
+log_master(f"BOS id: {BOS_ID}")
+log_master(f"Beacon stride: {BEACON_STRIDE}")
+log_master(f"Use beacon: {USE_BEACON}")
+log_master(f"Batch size: {BATCH_SIZE}")
+log_master(f"World size: {WORLD_SIZE}")
+
+
+MODEL = Transformer(
+    vocab_size=VOCAB_SIZE,
+    n_head=6,
+    n_layer=12,
+    beacon_id=BEACON_ID,
+    bos_id=BOS_ID,
+    beacon_stride=BEACON_STRIDE,
+).to(DEVICE)
+
+hidden_params = [p for p in MODEL.blocks.parameters()]
+direct_params = [p for p in MODEL.embed_tokens.parameters()] + [
+    p for p in MODEL.lm_head.parameters()
+]
+
+adam_optimizer = DistAdam(
+    direct_params, lr=3e-4, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1
+)
+muon_optimizer = Muon(hidden_params, lr=0.02, weight_decay=0.1, momentum=0.95)
+optimizers = [adam_optimizer, muon_optimizer]
+
+if DEVICE == "cuda":
+    model = torch.compile(MODEL, dynamic=False)
+
+
+## TRAINING LOOP
+
+total_step_time_ms = 0.0
+
+for step in range(MAX_STEPS + 1):
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    ids = next(TRAIN_LOADER)
+    assert ids.ndim == 1, "ids must be a 1D tensor"
+    if USE_BEACON:
+        ids = inject_beacon_to_docs(
+            ids, bos_id=BOS_ID, beacon_id=BEACON_ID, stride=BEACON_STRIDE
+        )
+    ids = ids[: BATCH_SIZE + 1]
+    inputs = ids[:-1].to(DEVICE, dtype=torch.int32)
+    targets = ids[1:].to(DEVICE, dtype=torch.int64)
+    targets[targets == BEACON_ID] = -100
+    mask = create_block_mask(
+        input_ids=inputs,
+        bos_id=BOS_ID,
+        beacon_id=BEACON_ID,
+        mask_type="beacon_causal_document" if USE_BEACON else "causal_document",
+    )
+    logits, loss = model(inputs, targets, mask)
+    loss.backward()
+
+    for opt in optimizers:
+        for group in opt.param_groups:
+            group["lr"] = group["initial_lr"] * get_const_then_linear_decay_lr(step)
+    for opt in optimizers:
+        opt.step()
+    MODEL.zero_grad(set_to_none=True)
+    torch.cuda.synchronize()
+    total_step_time_ms += (time.perf_counter() - t0) * 1000
+    log_master(
+        f"Step {step}, avg_step_time {total_step_time_ms / (step+1)} ms, train_loss {loss.item()}"
+    )
+
+    if step % SAMPLE_EVERY_N_STEPS == 0 and IS_MASTER:
+        sample_text = TOKENIZER.decode(
+            MODEL.generate(SAMPLE_TEXT_IDS, max_new_tokens=64, is_beacon=USE_BEACON)
+        )
+        log_master(f"Sample text: {sample_text}")

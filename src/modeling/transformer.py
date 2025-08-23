@@ -13,7 +13,7 @@ class KVCache:
         n_heads: int,
         max_seq_len: int,
         device: str = "cpu",
-        beacon_offset: int = 0,
+        beacon_stride: int = 0,
         dtype: torch.dtype = torch.bfloat16,
     ):
         self.n_layers = n_layers
@@ -21,7 +21,7 @@ class KVCache:
         self.n_heads = n_heads
         self.max_seq_len = max_seq_len
         self.device = device
-        self.beacon_offset = beacon_offset
+        self.beacon_stride = beacon_stride
         self.dtype = dtype
 
         self.keys = [
@@ -36,10 +36,10 @@ class KVCache:
         self.current_length = 0
 
     def need_new_beacon(self) -> bool:
-        return self.beacon_offset == self.not_beacon_counter
+        return self.beacon_stride == self.not_beacon_counter
 
     def get_new_length_after_reducing(self):
-        return self.current_length + 1 - self.beacon_offset
+        return self.current_length + 1 - self.beacon_stride
 
     def get_current_beacon_count(self):
         return self.current_length - self.not_beacon_counter
@@ -348,7 +348,7 @@ class Transformer(nn.Module):
         n_layer: int,
         beacon_id: int,
         bos_id: int,
-        beacon_offset: int = 0,
+        beacon_stride: int = 0,
     ):
         super().__init__()
         vocab_size = next_multiple_of_n(vocab_size, n=16)
@@ -363,7 +363,7 @@ class Transformer(nn.Module):
             [Block(n_head, hidden_size, max_seq_len) for _ in range(n_layer)]
         )
         self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
-        self.beacon_offset = beacon_offset
+        self.beacon_stride = beacon_stride
         self.beacon_id = beacon_id
         self.bos_id = bos_id
 
@@ -417,7 +417,10 @@ class Transformer(nn.Module):
         loss = None
         if labels is not None:
             loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=-100
+                logits.view(-1, logits.size(-1)),
+                labels.view(-1),
+                ignore_index=-100,
+                reduction="sum",
             )
 
         return logits, loss
@@ -436,7 +439,7 @@ class Transformer(nn.Module):
             head_dim=self.head_dim,
             n_heads=self.n_head,
             max_seq_len=kv_length,
-            beacon_offset=self.beacon_offset,
+            beacon_stride=self.beacon_stride,
             device=input_ids.device,
             dtype=self.embed_tokens.weight.dtype,
         )
@@ -514,7 +517,7 @@ if __name__ == "__main__":
         n_layer=1,
         beacon_id=24,
         bos_id=23,
-        beacon_offset=4,
+        beacon_stride=4,
     )
     input_ids = torch.randint(0, 100, (10,))
     labels = torch.randint(0, 100, (10,))
