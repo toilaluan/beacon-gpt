@@ -68,7 +68,7 @@ class KVCache:
             self.not_beacon_counter = not_beacon_counter
             self.current_length = seq_len
         elif self.need_new_beacon() and is_beacon:
-            new_beacon_index = self.get_new_length_after_reducing()
+            new_beacon_index = self.get_current_beacon_count()
             self.keys[layer_idx][:, :, new_beacon_index, :] = k.squeeze(2).to(
                 dtype=self.dtype
             )
@@ -77,7 +77,7 @@ class KVCache:
             )
             if layer_idx == 0:
                 self.not_beacon_counter = 0
-                self.current_length = new_beacon_index
+                self.current_length = new_beacon_index + 1
         else:
             self.keys[layer_idx][:, :, self.current_length, :] = k.squeeze(2).to(
                 dtype=self.dtype
@@ -87,18 +87,17 @@ class KVCache:
             )
             if layer_idx == 0:
                 self.current_length += 1
-                if is_beacon:
-                    self.not_beacon_counter += 1
+                self.not_beacon_counter += 1
         
         _after = (
             self.current_length,
             self.get_current_beacon_count(),
             self.not_beacon_counter,
         )
-        # if layer_idx == 0:
-        #     print(
-        #         f"KV Cache (current_length, beacon_count, not_beacon_counter): {_prev} -> {_after}"
-        #     )
+        if layer_idx == 0:
+            print(
+                f"KV Cache (current_length, beacon_count, not_beacon_counter): {_prev} -> {_after}"
+            )
 
     def get_kv(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         return (
@@ -230,7 +229,7 @@ class MultiHeadAttention(nn.Module):
         assert hidden_size % n_head == 0, "hidden_size must be divisible by n_head"
         self.head_dim = hidden_size // n_head
         self.rotary_emb = RotaryEmbedding(
-            head_dim=self.head_dim, max_seq_len=max_seq_len, base=10000
+            head_dim=self.head_dim, max_seq_len=max_seq_len, base=100000
         )
         self.to_qkv = CastedLinear(hidden_size, 3 * hidden_size, bias=False)
         self.out_proj = CastedLinear(hidden_size, hidden_size, bias=False)
@@ -294,6 +293,7 @@ class MultiHeadAttention(nn.Module):
                     k,
                     v,
                     prefill=False,
+                    is_beacon=kv_cache_args["is_beacon"],
                 )
                 k, v = kv_cache.get_kv(layer_idx)
         else:
@@ -397,9 +397,13 @@ class Transformer(nn.Module):
             and _kv_cache_args.get("is_beacon")
         ):
             beacon_mask = input_ids == self.beacon_id
-            last_beacon_index = beacon_mask.nonzero(as_tuple=True)[0][-1]
-            not_beacon_counter = int(input_ids.size(0) - last_beacon_index - 1)
-            beacon_mask[last_beacon_index:] = True
+            if beacon_mask.any():
+                last_beacon_index = beacon_mask.nonzero(as_tuple=True)[0][-1]
+                not_beacon_counter = int(input_ids.size(0) - last_beacon_index - 1)
+                beacon_mask[last_beacon_index:] = True
+            else:
+                not_beacon_counter = 0
+                beacon_mask = None
         else:
             beacon_mask = None
             not_beacon_counter = 0
@@ -427,7 +431,7 @@ class Transformer(nn.Module):
                 logits.view(-1, logits.size(-1)),
                 labels.view(-1),
                 ignore_index=-100,
-                reduction="sum",
+                reduction="mean",
             )
 
         return logits, loss
@@ -461,6 +465,7 @@ class Transformer(nn.Module):
         kv_cache_args = {
             "prefill": True,
             "beacon_reduction": False,
+            "is_beacon": is_beacon,
         }
         logits, _ = self.forward(
             input_ids, mask=None, kv_cache=kv_cache, kv_cache_args=kv_cache_args
@@ -501,7 +506,7 @@ class Transformer(nn.Module):
                     B=None,
                     H=None,
                     Q_LEN=1,
-                    KV_LEN=kv_cache.get_new_length_after_reducing(),
+                    KV_LEN=kv_cache.current_length,
                     device=input_ids.device,
                 )
                 logits, _ = self.forward(
@@ -544,12 +549,12 @@ if __name__ == "__main__":
         [23, 1, 2, 2, 24, 2, 1, 3, 5, 24, 2, 2], device=input_ids.device
     )
     start = time.time()
-    output = model.generate(input_ids, max_new_tokens=256, is_beacon=False)
+    output = model.generate(input_ids, max_new_tokens=16, is_beacon=False)
     print(output)
     print(f"Causal time taken: {time.time() - start} seconds")
 
     start = time.time()
-    output = model.generate(input_ids, max_new_tokens=256, is_beacon=True)
+    output = model.generate(input_ids, max_new_tokens=16, is_beacon=True)
     print(output)
     print(f"Beacon time taken: {time.time() - start} seconds")
 
