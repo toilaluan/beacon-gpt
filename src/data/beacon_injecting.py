@@ -6,9 +6,8 @@ def _inject_beacon_in_doc(
 ) -> torch.Tensor:
     """Inject beacon tokens into a document at regular stride intervals."""
     # Pad to multiple of stride
-    print(doc)
     n_pad = stride - doc.size(0) % stride
-    doc = torch.nn.functional.pad(doc, (0, n_pad), value=-100)
+    doc = torch.nn.functional.pad(doc, (0, n_pad), value=0)
     doc_length = doc.size(0)
     n_beacon = doc_length // stride
 

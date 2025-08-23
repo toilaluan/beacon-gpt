@@ -4,6 +4,9 @@ import torch.nn.functional as F
 from torch.nn.attention import flex_attention
 from typing import Tuple, Optional
 
+class CastedLinear(nn.Linear):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.linear(x, self.weight.type_as(x))
 
 class KVCache:
     def __init__(
@@ -72,8 +75,9 @@ class KVCache:
             self.values[layer_idx][:, :, new_beacon_index, :] = v.squeeze(2).to(
                 dtype=self.dtype
             )
-            self.not_beacon_counter = 0
-            self.current_length = new_beacon_index
+            if layer_idx == 0:
+                self.not_beacon_counter = 0
+                self.current_length = new_beacon_index
         else:
             self.keys[layer_idx][:, :, self.current_length, :] = k.squeeze(2).to(
                 dtype=self.dtype
@@ -81,17 +85,20 @@ class KVCache:
             self.values[layer_idx][:, :, self.current_length, :] = v.squeeze(2).to(
                 dtype=self.dtype
             )
-            self.current_length += 1
-            if is_beacon:
-                self.not_beacon_counter += 1
+            if layer_idx == 0:
+                self.current_length += 1
+                if is_beacon:
+                    self.not_beacon_counter += 1
+        
         _after = (
             self.current_length,
             self.get_current_beacon_count(),
             self.not_beacon_counter,
         )
-        print(
-            f"KV Cache (current_length, beacon_count, not_beacon_counter): {_prev} -> {_after}"
-        )
+        # if layer_idx == 0:
+        #     print(
+        #         f"KV Cache (current_length, beacon_count, not_beacon_counter): {_prev} -> {_after}"
+        #     )
 
     def get_kv(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         return (
@@ -225,13 +232,13 @@ class MultiHeadAttention(nn.Module):
         self.rotary_emb = RotaryEmbedding(
             head_dim=self.head_dim, max_seq_len=max_seq_len, base=10000
         )
-        self.to_qkv = nn.Linear(hidden_size, 3 * hidden_size, bias=False)
-        self.out_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.to_qkv = CastedLinear(hidden_size, 3 * hidden_size, bias=False)
+        self.out_proj = CastedLinear(hidden_size, hidden_size, bias=False)
         self.init_weights()
 
     def init_weights(self):
         for module in self.modules():
-            if isinstance(module, nn.Linear):
+            if isinstance(module, CastedLinear):
                 in_features = module.in_features
                 std = 0.5 * (in_features**-0.5)
                 bound = 3**0.5 * std
@@ -301,8 +308,8 @@ class MultiHeadAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, hidden_size: int, intermediate_size: int):
         super().__init__()
-        self.w1 = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.w2 = nn.Linear(intermediate_size, hidden_size, bias=False)
+        self.w1 = CastedLinear(hidden_size, intermediate_size, bias=False)
+        self.w2 = CastedLinear(intermediate_size, hidden_size, bias=False)
         self.init_weights()
 
     def init_weights(self):
@@ -362,7 +369,7 @@ class Transformer(nn.Module):
         self.blocks = nn.ModuleList(
             [Block(n_head, hidden_size, max_seq_len) for _ in range(n_layer)]
         )
-        self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
+        self.lm_head = CastedLinear(hidden_size, vocab_size, bias=False)
         self.beacon_stride = beacon_stride
         self.beacon_id = beacon_id
         self.bos_id = bos_id
@@ -469,7 +476,7 @@ class Transformer(nn.Module):
         }
 
         # Decoding phase
-        for _ in range(max_new_tokens):
+        for i in range(max_new_tokens):
             block_mask = flex_attention.create_block_mask(
                 mask_mod=get_block_mask_for_decoding(kv_cache),
                 B=None,

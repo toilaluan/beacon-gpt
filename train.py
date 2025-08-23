@@ -13,9 +13,12 @@ import time
 
 RANK = int(os.environ.get("RANK", 0))
 WORLD_SIZE = int(os.environ.get("WORLD_SIZE", 1))
+DEVICE = torch.device("cuda", RANK)
+torch.cuda.set_device(DEVICE)
 dist.init_process_group(
-    backend="nccl", init_method="env://", world_size=WORLD_SIZE, rank=RANK
+    backend="nccl", device_id=DEVICE,
 )
+dist.barrier()
 IS_MASTER = RANK == 0
 
 
@@ -35,8 +38,8 @@ def get_const_then_linear_decay_lr(
         return 1.0 * w + (1 - w) * min_lr
 
 
-TRAIN_DATA_PATTERN = "data/fineweb10B/fineweb_train_%06d.bin"
-VAL_DATA_PATTERN = "data/fineweb10B/fineweb_val_%06d.bin"
+TRAIN_DATA_PATTERN = "scripts/data/fineweb10B/fineweb_train_*.bin"
+VAL_DATA_PATTERN = "scripts/data/fineweb10B/fineweb_val_*.bin"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE = 48 * 1024
 TOKENIZER = tiktoken.get_encoding("gpt2")
@@ -46,11 +49,11 @@ TRAIN_LOADER = distributed_data_generator(
 )
 SAMPLE_TEXT = "Hello, i am "
 SAMPLE_TEXT_IDS = TOKENIZER.encode(SAMPLE_TEXT)
-SAMPLE_TEXT_IDS = torch.tensor(SAMPLE_TEXT_IDS, dtype=torch.int32)
 USE_BEACON = True
 BEACON_STRIDE = 16
 BOS_ID = 50256
 BEACON_ID = 50257
+SAMPLE_TEXT_IDS = torch.tensor([BOS_ID]+SAMPLE_TEXT_IDS, dtype=torch.int32)
 VOCAB_SIZE = next_multiple_of_n(TOKENIZER.n_vocab, n=16)
 MAX_STEPS = 5000
 DECAYING_RATIO = 0.45
@@ -76,10 +79,18 @@ MODEL = Transformer(
     vocab_size=VOCAB_SIZE,
     n_head=6,
     n_layer=12,
+    hidden_size=768,
+    max_seq_len=BATCH_SIZE,
     beacon_id=BEACON_ID,
     bos_id=BOS_ID,
     beacon_stride=BEACON_STRIDE,
 ).to(DEVICE)
+
+for m in MODEL.modules():
+    if isinstance(m, torch.nn.Embedding):
+        m.bfloat16()
+for param in MODEL.parameters():
+    dist.broadcast(param.detach(), 0)
 
 hidden_params = [p for p in MODEL.blocks.parameters()]
 direct_params = [p for p in MODEL.embed_tokens.parameters()] + [
@@ -91,6 +102,10 @@ adam_optimizer = DistAdam(
 )
 muon_optimizer = Muon(hidden_params, lr=0.02, weight_decay=0.1, momentum=0.95)
 optimizers = [adam_optimizer, muon_optimizer]
+
+for opt in optimizers:
+    for group in opt.param_groups:
+        group["initial_lr"] = group["lr"]
 
 if DEVICE == "cuda":
     model = torch.compile(MODEL, dynamic=False)
@@ -124,7 +139,7 @@ for step in range(MAX_STEPS + 1):
 
     for opt in optimizers:
         for group in opt.param_groups:
-            group["lr"] = group["initial_lr"] * get_const_then_linear_decay_lr(step)
+            group["lr"] = group["initial_lr"] * get_const_then_linear_decay_lr(step, MAX_STEPS)
     for opt in optimizers:
         opt.step()
     MODEL.zero_grad(set_to_none=True)
@@ -136,6 +151,6 @@ for step in range(MAX_STEPS + 1):
 
     if step % SAMPLE_EVERY_N_STEPS == 0 and IS_MASTER:
         sample_text = TOKENIZER.decode(
-            MODEL.generate(SAMPLE_TEXT_IDS, max_new_tokens=64, is_beacon=USE_BEACON)
+            MODEL.generate(SAMPLE_TEXT_IDS.to(DEVICE), max_new_tokens=64, is_beacon=USE_BEACON).cpu().tolist()
         )
         log_master(f"Sample text: {sample_text}")
