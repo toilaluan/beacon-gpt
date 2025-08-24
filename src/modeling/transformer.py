@@ -416,14 +416,16 @@ class Transformer(nn.Module):
             non_zero = beacon_mask.nonzero(as_tuple=True)[0]
             if non_zero.size(0) != 0:
                 last_beacon_index = non_zero[-1]
-                not_beacon_counter = int(input_ids.size(0) - last_beacon_index - 1)
-                beacon_mask[last_beacon_index:] = True
-                _kv_cache_args.update(
-                    {
-                        "beacon_mask": beacon_mask,
-                        "not_beacon_counter": not_beacon_counter,
-                    }
-                )
+            else:
+                last_beacon_index = -1
+            not_beacon_counter = int(input_ids.size(0) - last_beacon_index - 1)
+            beacon_mask[last_beacon_index+1:] = True
+            _kv_cache_args.update(
+                {
+                    "beacon_mask": beacon_mask,
+                    "not_beacon_counter": not_beacon_counter,
+                }
+            )
         x = self.embed_tokens(input_ids.unsqueeze(0))
         for i, block in enumerate(self.blocks):
             x = block(
@@ -508,18 +510,18 @@ class Transformer(nn.Module):
 
 if __name__ == "__main__":
     import time
-
+    import tiktoken
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     model = Transformer(
-        vocab_size=100,
+        vocab_size=56000,
         n_head=4,
         hidden_size=128,
         max_seq_len=1024,
         n_layer=3,
         beacon_id=24,
         bos_id=23,
-        beacon_stride=4,
+        beacon_stride=16,
     ).to(device)
     input_ids = torch.randint(0, 100, (10,), device=device)
     labels = torch.randint(0, 100, (10,), device=device)
@@ -538,14 +540,21 @@ if __name__ == "__main__":
     input_ids = torch.tensor(
         [23, 1, 2, 2, 24, 2, 1, 3, 5, 24, 2, 2], device=device
     )
-    start = time.time()
-    output = model.generate(input_ids, max_new_tokens=64, use_beacon=False)
-    print(output)
-    print(f"Causal time taken: {time.time() - start} seconds")
+    # start = time.time()
+    # output = model.generate(input_ids, max_new_tokens=64, use_beacon=False)
+    # print(output)
+    # print(f"Causal time taken: {time.time() - start} seconds")
 
-    start = time.time()
+    # start = time.time()
+    # output = model.generate(input_ids, max_new_tokens=64, use_beacon=True)
+    # print(output)
+    # print(f"Beacon time taken: {time.time() - start} seconds")
+
+    text = "In the US, "
+    tokenizer = tiktoken.get_encoding("gpt2")
+    text_ids = tokenizer.encode(text)
+    input_ids = torch.tensor([23] + text_ids, device=device)
+    print(input_ids)
     output = model.generate(input_ids, max_new_tokens=64, use_beacon=True)
     print(output)
-    print(f"Beacon time taken: {time.time() - start} seconds")
-
     # ! Beacon is faster
