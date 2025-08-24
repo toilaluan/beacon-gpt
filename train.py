@@ -2,13 +2,13 @@ import tiktoken
 from src.modeling.transformer import Transformer, next_multiple_of_n, create_block_mask
 from src.data.dist_dataloader import distributed_data_generator
 from src.data.beacon_injecting import inject_beacon_to_docs
-from src.optimizer.muon import DistAdam, Muon
+from torch.optim import AdamW
 import torch
 import torch.distributed as dist
 import os
 from loguru import logger
 import time
-
+from safetensors.torch import load_file
 # Distributed Init
 
 RANK = int(os.environ.get("RANK", 0))
@@ -41,7 +41,7 @@ def get_const_then_linear_decay_lr(
 TRAIN_DATA_PATTERN = "scripts/data/fineweb10B/fineweb_train_*.bin"
 VAL_DATA_PATTERN = "scripts/data/fineweb10B/fineweb_val_*.bin"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-BATCH_SIZE = 48 * 1024
+BATCH_SIZE = 8 * 1024
 TOKENIZER = tiktoken.get_encoding("gpt2")
 TOKENIZER._special_tokens = {}
 TRAIN_LOADER = distributed_data_generator(
@@ -77,14 +77,28 @@ log_master(f"World size: {WORLD_SIZE}")
 
 MODEL = Transformer(
     vocab_size=VOCAB_SIZE,
-    n_head=6,
-    n_layer=12,
-    hidden_size=768,
+    head_dim=256,
+    num_kv_heads=1,
+    num_attention_heads=4,
+    n_layer=18,
+    hidden_size=640,
+    intermediate_size=2048,
     max_seq_len=BATCH_SIZE,
     beacon_id=BEACON_ID,
     bos_id=BOS_ID,
     beacon_stride=BEACON_STRIDE,
 ).to(DEVICE)
+
+STATE_DICT = load_file("checkpoints/gemma3/model.safetensors")
+RENAME_STATE_DICT = {}
+for k, v in STATE_DICT.items():
+    RENAME_STATE_DICT[k.replace("model.", "")] = v
+MODEL.load_state_dict(RENAME_STATE_DICT, strict=False)
+del STATE_DICT
+del RENAME_STATE_DICT
+
+if IS_MASTER:
+    print(MODEL)
 
 for m in MODEL.modules():
     if isinstance(m, torch.nn.Embedding):
@@ -92,23 +106,22 @@ for m in MODEL.modules():
 for param in MODEL.parameters():
     dist.broadcast(param.detach(), 0)
 
-hidden_params = [p for p in MODEL.blocks.parameters()]
+hidden_params = [p for p in MODEL.layers.parameters()]
 direct_params = [p for p in MODEL.embed_tokens.parameters()] + [
     p for p in MODEL.lm_head.parameters()
 ]
 
-adam_optimizer = DistAdam(
-    direct_params, lr=3e-4, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1
+adam_optimizer = AdamW(
+    direct_params + hidden_params, lr=3e-4, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1, fused=True
 )
-muon_optimizer = Muon(hidden_params, lr=0.02, weight_decay=0.1, momentum=0.95)
-optimizers = [adam_optimizer, muon_optimizer]
+optimizers = [adam_optimizer]
 
 for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
 
-if DEVICE == "cuda":
-    model = torch.compile(MODEL, dynamic=False)
+# if DEVICE == "cuda":
+#     model = torch.compile(MODEL, dynamic=False)
 
 
 ## TRAINING LOOP
@@ -134,7 +147,7 @@ for step in range(MAX_STEPS + 1):
         beacon_id=BEACON_ID,
         mask_type="beacon_causal_document" if USE_BEACON else "causal_document",
     )
-    logits, loss = model(inputs, targets, mask)
+    logits, loss = MODEL(inputs, targets, mask)
     loss.backward()
 
     for opt in optimizers:
@@ -151,6 +164,6 @@ for step in range(MAX_STEPS + 1):
 
     if step % SAMPLE_EVERY_N_STEPS == 0 and IS_MASTER:
         sample_text = TOKENIZER.decode(
-            MODEL.generate(SAMPLE_TEXT_IDS.to(DEVICE), max_new_tokens=64, is_beacon=USE_BEACON).cpu().tolist()
+            MODEL.generate(SAMPLE_TEXT_IDS.to(DEVICE), max_new_tokens=64, use_beacon=USE_BEACON).cpu().tolist()
         )
         log_master(f"Sample text: {sample_text}")

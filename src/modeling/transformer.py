@@ -182,6 +182,16 @@ def create_block_mask(
         device=input_ids.device,
     )
 
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
+    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+    """
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 def rms_norm(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
     return F.rms_norm(x, (x.size(-1),), eps=eps)
@@ -228,17 +238,30 @@ class RotaryEmbedding(nn.Module):
 
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, n_head: int, hidden_size: int, max_seq_len: int):
+    def __init__(self, num_attention_heads: int, head_dim: int, max_seq_len: int, num_kv_heads: int, hidden_size: int):
         super().__init__()
-        self.n_head = n_head
+        self.num_attention_heads = num_attention_heads
         self.hidden_size = hidden_size
-        assert hidden_size % n_head == 0, "hidden_size must be divisible by n_head"
-        self.head_dim = hidden_size // n_head
+        self.head_dim = head_dim
+        self.num_kv_heads = num_kv_heads
         self.rotary_emb = RotaryEmbedding(
             head_dim=self.head_dim, max_seq_len=max_seq_len, base=100000
         )
-        self.to_qkv = CastedLinear(hidden_size, 3 * hidden_size, bias=False)
-        self.out_proj = CastedLinear(hidden_size, hidden_size, bias=False)
+        self.q_proj = CastedLinear(
+            hidden_size, num_attention_heads * self.head_dim, bias=False
+        )
+        self.k_proj = CastedLinear(
+            hidden_size, num_kv_heads * self.head_dim, bias=False
+        )
+        self.v_proj = CastedLinear(
+            hidden_size, num_kv_heads * self.head_dim, bias=False
+        )
+        self.o_proj = CastedLinear(
+            num_attention_heads * self.head_dim, hidden_size, bias=False
+        )
+        self.num_key_value_groups = num_attention_heads // num_kv_heads
+        self.q_norm = nn.LayerNorm(self.head_dim, bias=False)
+        self.k_norm = nn.LayerNorm(self.head_dim, bias=False)
         self.init_weights()
 
     def init_weights(self):
@@ -249,7 +272,7 @@ class MultiHeadAttention(nn.Module):
                 bound = 3**0.5 * std
                 with torch.no_grad():
                     module.weight.uniform_(-bound, bound)
-        self.out_proj.weight.data.zero_()
+        self.o_proj.weight.data.zero_()
 
     def forward(
         self,
@@ -267,13 +290,13 @@ class MultiHeadAttention(nn.Module):
         kv_cache_args: dict, arguments for KV cache
         """
         B, L, _ = x.shape
-        q, k, v = self.to_qkv(x).split(self.hidden_size, dim=2)
-        q = q.view(B, L, self.n_head, self.head_dim).transpose(1, 2)
-        k = k.view(B, L, self.n_head, self.head_dim).transpose(1, 2)
-        v = v.view(B, L, self.n_head, self.head_dim).transpose(1, 2)
+        q, k, v = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        q = q.view(B, L, self.num_attention_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, L, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, L, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
-        q = rms_norm(q)
-        k = rms_norm(k)
+        q = self.q_norm(q.float()).type_as(q)
+        k = self.k_norm(k.float()).type_as(k)
 
         if kv_cache is not None:
             if kv_cache_args["prefill"]:
@@ -303,31 +326,38 @@ class MultiHeadAttention(nn.Module):
         else:
             q = self.rotary_emb(q)
             k = self.rotary_emb(k)
+        # k = repeat_kv(k, self.num_key_value_groups)
+        # v = repeat_kv(v, self.num_key_value_groups)
 
-        out = flex_attention.flex_attention(q, k, v, block_mask=block_mask)
-        out = out.transpose(1, 2).reshape(B, L, self.hidden_size)
-        return self.out_proj(out)
+        out = flex_attention.flex_attention(q, k, v, block_mask=block_mask, enable_gqa=True)
+        out = out.transpose(1, 2).reshape(B, L, -1)
+        return self.o_proj(out)
 
 
 class MLP(nn.Module):
     def __init__(self, hidden_size: int, intermediate_size: int):
         super().__init__()
-        self.w1 = CastedLinear(hidden_size, intermediate_size, bias=False)
-        self.w2 = CastedLinear(intermediate_size, hidden_size, bias=False)
+        self.down_proj = CastedLinear(intermediate_size, hidden_size, bias=False)
+        self.up_proj = CastedLinear(hidden_size, intermediate_size, bias=False)
+        self.gate_proj = CastedLinear(hidden_size, intermediate_size, bias=False)
         self.init_weights()
 
     def init_weights(self):
-        self.w2.weight.detach().zero_()
+        self.up_proj.weight.data.zero_()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.w2(F.relu(self.w1(x)).square())
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
 class Block(nn.Module):
-    def __init__(self, n_head: int, hidden_size: int, max_seq_len: int):
+    def __init__(self, num_attention_heads: int, num_kv_heads: int, head_dim: int, max_seq_len: int, hidden_size: int, intermediate_size: int):
         super().__init__()
-        self.attn = MultiHeadAttention(n_head, hidden_size, max_seq_len)
-        self.mlp = MLP(hidden_size, 4 * hidden_size)
+        self.self_attn = MultiHeadAttention(num_attention_heads, head_dim, max_seq_len, num_kv_heads, hidden_size)
+        self.mlp = MLP(hidden_size, intermediate_size)
+        self.input_layernorm = nn.LayerNorm(hidden_size, bias=False)
+        self.post_attention_layernorm = nn.LayerNorm(hidden_size, bias=False)
+        self.post_feedforward_layernorm = nn.LayerNorm(hidden_size, bias=False)
+        self.pre_feedforward_layernorm = nn.LayerNorm(hidden_size, bias=False)
 
     def forward(
         self,
@@ -337,15 +367,20 @@ class Block(nn.Module):
         layer_idx: Optional[int] = None,
         kv_cache_args: Optional[dict] = None,
     ) -> torch.Tensor:
-        x_attn = self.attn(
-            rms_norm(x),
+        x = self.input_layernorm(x.float()).type_as(x)
+        x_attn = self.self_attn(
+            x,
             block_mask,
             kv_cache,
             layer_idx,
             kv_cache_args,
         )
-        x = x + x_attn
-        x = x + self.mlp(rms_norm(x))
+        x = x + self.post_attention_layernorm(x_attn.float()).type_as(x)
+        residual = x
+        x = self.pre_feedforward_layernorm(x.float()).type_as(x)
+        x = self.mlp(x)
+        x = self.post_feedforward_layernorm(x.float()).type_as(x)
+        x = x + residual
         return x
 
 
@@ -353,9 +388,12 @@ class Transformer(nn.Module):
     def __init__(
         self,
         vocab_size: int,
-        n_head: int,
+        head_dim: int,
         hidden_size: int,
+        intermediate_size: int,
         max_seq_len: int,
+        num_kv_heads: int,
+        num_attention_heads: int,
         n_layer: int,
         beacon_id: int,
         bos_id: int,
@@ -365,13 +403,14 @@ class Transformer(nn.Module):
         vocab_size = next_multiple_of_n(vocab_size, n=16)
         self.vocab_size = vocab_size
         self.n_layer = n_layer
-        self.n_head = n_head
+        self.n_head = num_attention_heads
         self.hidden_size = hidden_size
-        self.head_dim = hidden_size // n_head
+        self.head_dim = head_dim
+        self.num_kv_heads = num_kv_heads
         self.max_seq_len = max_seq_len
         self.embed_tokens = nn.Embedding(vocab_size, hidden_size)
-        self.blocks = nn.ModuleList(
-            [Block(n_head, hidden_size, max_seq_len) for _ in range(n_layer)]
+        self.layers = nn.ModuleList(
+            [Block(num_attention_heads, num_kv_heads, head_dim, max_seq_len, hidden_size, intermediate_size) for _ in range(n_layer)]
         )
         self.lm_head = CastedLinear(hidden_size, vocab_size, bias=False)
         self.beacon_stride = beacon_stride
@@ -415,7 +454,7 @@ class Transformer(nn.Module):
                     }
                 )
         x = self.embed_tokens(input_ids.unsqueeze(0))
-        for i, block in enumerate(self.blocks):
+        for i, block in enumerate(self.layers):
             x = block(
                 x,
                 block_mask=mask,
