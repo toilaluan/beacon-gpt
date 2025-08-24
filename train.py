@@ -8,6 +8,8 @@ import torch.distributed as dist
 import os
 from loguru import logger
 import time
+import wandb
+import datetime
 
 # Distributed Init
 
@@ -41,13 +43,13 @@ def get_const_then_linear_decay_lr(
 TRAIN_DATA_PATTERN = "scripts/data/fineweb10B/fineweb_train_*.bin"
 VAL_DATA_PATTERN = "scripts/data/fineweb10B/fineweb_val_*.bin"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-BATCH_SIZE = 48 * 1024
+BATCH_SIZE = 24 * 1024
 TOKENIZER = tiktoken.get_encoding("gpt2")
 TOKENIZER._special_tokens = {}
 TRAIN_LOADER = distributed_data_generator(
     TRAIN_DATA_PATTERN, batch_size=BATCH_SIZE * WORLD_SIZE, align_to_bos=True
 )
-SAMPLE_TEXT = "Hello, i am "
+SAMPLE_TEXT = "In the US, "
 SAMPLE_TEXT_IDS = TOKENIZER.encode(SAMPLE_TEXT)
 USE_BEACON = True
 BEACON_STRIDE = 16
@@ -64,6 +66,8 @@ if USE_BEACON:
     SAMPLE_TEXT_IDS = inject_beacon_to_docs(
         SAMPLE_TEXT_IDS, bos_id=BOS_ID, beacon_id=BEACON_ID, stride=BEACON_STRIDE
     )
+if IS_MASTER:
+    wandb.init(project="beacon-gpt", name=f"beacon:{USE_BEACON}-beacon_stride:{BEACON_STRIDE}-{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}")
 log_master(f"Sample text: {SAMPLE_TEXT}")
 log_master(f"Sample text ids: {SAMPLE_TEXT_IDS}")
 log_master(f"Vocab size: {VOCAB_SIZE}")
@@ -146,11 +150,17 @@ for step in range(MAX_STEPS + 1):
     torch.cuda.synchronize()
     total_step_time_ms += (time.perf_counter() - t0) * 1000
     log_master(
-        f"Step {step}, avg_step_time {total_step_time_ms / (step+1)} ms, train_loss {loss.item()}"
+        f"Step {step}, avg_step_time {total_step_time_ms / (step+1)} ms, train_loss {loss.item() / BATCH_SIZE}"
     )
+    if IS_MASTER:
+        wandb.log({
+            "train_loss": loss.item() / BATCH_SIZE,
+            "step_time": total_step_time_ms / (step+1),
+            "step": step,
+        })
 
     if step % SAMPLE_EVERY_N_STEPS == 0 and IS_MASTER:
         sample_text = TOKENIZER.decode(
-            MODEL.generate(SAMPLE_TEXT_IDS.to(DEVICE), max_new_tokens=64, is_beacon=USE_BEACON).cpu().tolist()
+            MODEL.generate(SAMPLE_TEXT_IDS.to(DEVICE), max_new_tokens=64, use_beacon=USE_BEACON).cpu().tolist()
         )
         log_master(f"Sample text: {sample_text}")
