@@ -2,6 +2,7 @@ import tiktoken
 from src.modeling.transformer import Transformer, next_multiple_of_n, create_block_mask
 from src.data.dist_dataloader import distributed_data_generator
 from src.data.beacon_injecting import inject_beacon_to_docs
+from src.utils import visualize_attention_scores
 from src.optimizer.muon import DistAdam, Muon
 import torch
 import torch.distributed as dist
@@ -51,7 +52,7 @@ TRAIN_LOADER = distributed_data_generator(
 )
 SAMPLE_TEXT = "In the US, "
 SAMPLE_TEXT_IDS = TOKENIZER.encode(SAMPLE_TEXT)
-USE_BEACON = True
+USE_BEACON = False
 BEACON_STRIDE = 16
 BOS_ID = 50256
 BEACON_ID = 50257
@@ -113,6 +114,23 @@ for opt in optimizers:
 
 if DEVICE == "cuda":
     model = torch.compile(MODEL, dynamic=False)
+
+
+sample = next(TRAIN_LOADER)[:80]
+if IS_MASTER:
+    print(sample.tolist())
+    print(inject_beacon_to_docs(sample, bos_id=BOS_ID, beacon_id=BEACON_ID, stride=BEACON_STRIDE).tolist())
+    fake_q = torch.rand(1, 1, len(sample), 16, device="cpu")
+    fake_k = torch.rand(1, 1, len(sample), 16, device="cpu")
+    mask_mod = create_block_mask(
+        inject_beacon_to_docs(sample.cpu(), bos_id=BOS_ID, beacon_id=BEACON_ID, stride=BEACON_STRIDE),
+        bos_id=BOS_ID,
+        beacon_id=BEACON_ID,
+        mask_type="beacon_causal_document",
+        return_block_mask=False,
+    )
+    visualize_attention_scores(fake_q, fake_k, mask_mod=mask_mod, device="cpu")
+    # print(TOKENIZER.decode(inject_beacon_to_docs(sample.cpu(), bos_id=BOS_ID, beacon_id=BEACON_ID, stride=BEACON_STRIDE).cpu().tolist()))
 
 
 ## TRAINING LOOP

@@ -1,36 +1,22 @@
 import torch
 
 
-def _inject_beacon_in_doc(
-    doc: torch.Tensor, beacon_id: int, stride: int
-) -> torch.Tensor:
-    """Inject beacon tokens into a document at regular stride intervals."""
-    # Pad to multiple of stride
-    n_pad = stride - doc.size(0) % stride
-    doc = torch.nn.functional.pad(doc, (0, n_pad), value=0)
-    doc_length = doc.size(0)
-    n_beacon = doc_length // stride
-
-    if n_beacon == 0:
+def _inject_beacon_in_doc(doc: torch.Tensor, beacon_id: int, stride: int) -> torch.Tensor:
+    """Insert a beacon after every `stride` tokens. No padding; preserves all tokens."""
+    assert doc.ndim == 1
+    if stride <= 0:
+        return doc
+    L = doc.numel()
+    n_full = L // stride
+    if n_full == 0:
         return doc
 
-    # Create beacon tensor once
-    beacon_tensor = torch.full(
-        (n_beacon,), beacon_id, dtype=doc.dtype, device=doc.device
-    )
+    chunks = doc[: n_full * stride].view(n_full, stride)                  # [n_full, stride]
+    beacons = torch.full((n_full, 1), beacon_id, dtype=doc.dtype, device=doc.device)  # [n_full, 1]
+    interleaved = torch.cat([chunks, beacons], dim=1).reshape(-1)          # [(stride+1)*n_full]
+    remainder = doc[n_full * stride:]                                      # [L - n_full*stride]
+    return torch.cat([interleaved, remainder], dim=0)
 
-    # Reshape doc into chunks of stride length
-    doc_chunks = doc[: n_beacon * stride].view(n_beacon, stride)
-
-    # Interleave doc chunks with beacon tokens
-    result = torch.cat([doc_chunks, beacon_tensor.unsqueeze(1)], dim=1)
-    result = result.view(-1)
-
-    # Append remaining tokens if any
-    remainder = doc[n_beacon * stride :]
-    if remainder.numel() > 0:
-        result = torch.cat([result, remainder])
-    return result[: -(n_pad + 1)]
 
 
 def inject_beacon_to_docs(

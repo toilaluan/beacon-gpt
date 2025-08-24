@@ -88,10 +88,11 @@ class KVCache:
                 self.not_beacon_counter = 0
                 self.current_length = new_beacon_index + 1
         else:
-            self.keys[layer_idx][:, :, self.current_length, :] = k.squeeze(2).to(
+            idx = self.current_length if layer_idx == 0 else self.current_length - 1
+            self.keys[layer_idx][:, :, idx, :] = k.squeeze(2).to(
                 dtype=self.dtype
             )
-            self.values[layer_idx][:, :, self.current_length, :] = v.squeeze(2).to(
+            self.values[layer_idx][:, :, idx, :] = v.squeeze(2).to(
                 dtype=self.dtype
             )
             if layer_idx == 0:
@@ -170,6 +171,7 @@ def create_block_mask(
     beacon_id: int = None,
     mask_type: str = "causal_document",
     decoding: bool = False,
+    return_block_mask: bool = True,
 ):
     if mask_type == "causal_document":
         mask_mod = get_causal_document_mask_mod(input_ids, bos_id)
@@ -177,15 +179,16 @@ def create_block_mask(
         mask_mod = get_beacon_causal_document_mask_mod(input_ids, bos_id, beacon_id)
     else:
         raise ValueError(f"Invalid mask type: {mask_type}")
-
-    return flex_attention.create_block_mask(
-        mask_mod=mask_mod,
-        B=None,
-        H=None,
-        Q_LEN=input_ids.size(0) if not decoding else 1,
-        KV_LEN=input_ids.size(0),
-        device=input_ids.device,
-    )
+    if return_block_mask:
+        return flex_attention.create_block_mask(
+            mask_mod=mask_mod,
+            B=None,
+            H=None,
+            Q_LEN=input_ids.size(0) if not decoding else 1,
+            KV_LEN=input_ids.size(0),
+            device=input_ids.device,
+        )
+    return mask_mod
 
 
 def rms_norm(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
@@ -467,10 +470,10 @@ class Transformer(nn.Module):
             mask_type="beacon_causal_document" if use_beacon else "causal_document",
             decoding=False,
         )
-        self.forward(input_ids, mask=pre_mask, kv_cache=kv_cache, kv_cache_args={"prefill": True})
-
-        decoded_tokens = input_ids.clone()
-        cur = decoded_tokens[-1:].contiguous()
+        logits, _ = self.forward(input_ids, mask=pre_mask, kv_cache=kv_cache, kv_cache_args={"prefill": True})
+        next_tok = torch.argmax(logits[:, -1, :], dim=-1, keepdim=False)
+        decoded_tokens = torch.cat([input_ids, next_tok], dim=0)
+        cur = next_tok
 
         for _ in range(max_new_tokens):
             # If due, insert beacon FIRST (don’t append beacon to output),
@@ -478,7 +481,7 @@ class Transformer(nn.Module):
             if kv_cache.need_new_beacon():
                 idx = kv_cache.get_current_beacon_count()
                 beacon_mask = flex_attention.create_block_mask(
-                    mask_mod=get_block_mask_for_decoding(kv_cache),
+                    mask_mod=lambda b, h, q_idx, kv_idx: idx+1>= kv_idx,
                     B=None, H=None, Q_LEN=1, KV_LEN=idx + 1, device=cur.device,
                 )
                 logits, _ = self.forward(
@@ -493,9 +496,10 @@ class Transformer(nn.Module):
                 continue  # ← important: skip the normal step this iteration
 
             # Normal step: sample one token based on current context
+            old_length = kv_cache.current_length
             step_mask = flex_attention.create_block_mask(
-                mask_mod=get_block_mask_for_decoding(kv_cache),
-                B=None, H=None, Q_LEN=1, KV_LEN=kv_cache.current_length + 1, device=cur.device,
+                mask_mod=lambda b, h, q_idx, kv_idx: old_length + 1 >= kv_idx,
+                B=None, H=None, Q_LEN=1, KV_LEN=old_length + 1, device=cur.device,
             )
             logits, _ = self.forward(
                 cur, mask=step_mask, kv_cache=kv_cache, kv_cache_args={"prefill": False}
