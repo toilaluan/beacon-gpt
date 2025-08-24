@@ -5,3 +5,5 @@
 With the release of `flex_attention` (pytorch), it's easier to implement scalable training for sparse attention
 I also want to pretraining the method instead of tuning from instruct model (original work)
 Current implementation has some techniques reference to https://github.com/KellerJordan/modded-nanogpt
+
+<img width="640" height="512" alt="image" src="./attention_scores.png" />
