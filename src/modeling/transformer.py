@@ -4,9 +4,11 @@ import torch.nn.functional as F
 from torch.nn.attention import flex_attention
 from typing import Tuple, Optional
 
+
 class CastedLinear(nn.Linear):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.linear(x, self.weight.type_as(x))
+
 
 class KVCache:
     def __init__(
@@ -18,6 +20,7 @@ class KVCache:
         device: str = "cpu",
         beacon_stride: int = 0,
         dtype: torch.dtype = torch.bfloat16,
+        use_beacon: bool = False,
     ):
         self.n_layers = n_layers
         self.head_dim = head_dim
@@ -26,6 +29,7 @@ class KVCache:
         self.device = device
         self.beacon_stride = beacon_stride
         self.dtype = dtype
+        self.use_beacon = use_beacon
 
         self.keys = [
             torch.empty(1, n_heads, max_seq_len, head_dim, device=device, dtype=dtype)
@@ -37,15 +41,13 @@ class KVCache:
         ]
         self.not_beacon_counter = 0
         self.current_length = 0
+        self.uncompressed_length = 0
 
     def need_new_beacon(self) -> bool:
-        return self.beacon_stride == self.not_beacon_counter
-
-    def get_new_length_after_reducing(self):
-        return self.current_length + 1 - self.beacon_stride
+        return self.beacon_stride == self.not_beacon_counter and self.use_beacon
 
     def get_current_beacon_count(self):
-        return self.current_length - self.not_beacon_counter
+        return (self.current_length - self.not_beacon_counter) if self.use_beacon else 0
 
     def update(
         self,
@@ -54,12 +56,12 @@ class KVCache:
         v: torch.Tensor,
         prefill: bool = False,
         not_beacon_counter: int = 0,
-        is_beacon: bool = False,
     ):
         _prev = (
             self.current_length,
             self.get_current_beacon_count(),
             self.not_beacon_counter,
+            self.uncompressed_length,
         )
         if prefill:
             seq_len = k.size(2)
@@ -67,7 +69,8 @@ class KVCache:
             self.values[layer_idx][:, :, :seq_len, :] = v.to(dtype=self.dtype)
             self.not_beacon_counter = not_beacon_counter
             self.current_length = seq_len
-        elif self.need_new_beacon() and is_beacon:
+            self.uncompressed_length = seq_len
+        elif self.need_new_beacon():
             new_beacon_index = self.get_current_beacon_count()
             self.keys[layer_idx][:, :, new_beacon_index, :] = k.squeeze(2).to(
                 dtype=self.dtype
@@ -76,6 +79,7 @@ class KVCache:
                 dtype=self.dtype
             )
             if layer_idx == 0:
+                self.uncompressed_length += 1
                 self.not_beacon_counter = 0
                 self.current_length = new_beacon_index + 1
         else:
@@ -87,16 +91,18 @@ class KVCache:
             )
             if layer_idx == 0:
                 self.current_length += 1
+                self.uncompressed_length += 1
                 self.not_beacon_counter += 1
-        
+
         _after = (
             self.current_length,
             self.get_current_beacon_count(),
             self.not_beacon_counter,
+            self.uncompressed_length,
         )
         if layer_idx == 0:
             print(
-                f"KV Cache (current_length, beacon_count, not_beacon_counter): {_prev} -> {_after}"
+                f"KV Cache (current_length, beacon_count, not_beacon_counter, uncompressed_length): {_prev} -> {_after}"
             )
 
     def get_kv(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -282,18 +288,16 @@ class MultiHeadAttention(nn.Module):
                     v,
                     prefill=True,
                     not_beacon_counter=kv_cache_args["not_beacon_counter"],
-                    is_beacon=kv_cache_args["is_beacon"],
                 )
                 k, v = kv_cache.get_kv(layer_idx)
             else:
-                q = self.rotary_emb(q, position=kv_cache.current_length)
-                k = self.rotary_emb(k, position=kv_cache.current_length)
+                q = self.rotary_emb(q, position=kv_cache.uncompressed_length)
+                k = self.rotary_emb(k, position=kv_cache.uncompressed_length)
                 kv_cache.update(
                     layer_idx,
                     k,
                     v,
                     prefill=False,
-                    is_beacon=kv_cache_args["is_beacon"],
                 )
                 k, v = kv_cache.get_kv(layer_idx)
         else:
@@ -387,32 +391,29 @@ class Transformer(nn.Module):
         ), f"input_ids must be a 1D tensor, but got {input_ids}"
         _kv_cache_args = {
             "prefill": False,
-            "is_beacon": False,
+            "use_beacon": False,
+            "beacon_mask": None,
+            "not_beacon_counter": 0,
         }
         if kv_cache_args is not None:
             _kv_cache_args.update(kv_cache_args)
         if (
             kv_cache is not None
             and _kv_cache_args.get("prefill")
-            and _kv_cache_args.get("is_beacon")
+            and kv_cache.use_beacon
         ):
             beacon_mask = input_ids == self.beacon_id
-            if beacon_mask.any():
-                last_beacon_index = beacon_mask.nonzero(as_tuple=True)[0][-1]
+            non_zero = beacon_mask.nonzero(as_tuple=True)[0]
+            if non_zero.size(0) != 0:
+                last_beacon_index = non_zero[-1]
                 not_beacon_counter = int(input_ids.size(0) - last_beacon_index - 1)
                 beacon_mask[last_beacon_index:] = True
-            else:
-                not_beacon_counter = 0
-                beacon_mask = None
-        else:
-            beacon_mask = None
-            not_beacon_counter = 0
-        _kv_cache_args.update(
-            {
-                "beacon_mask": beacon_mask,
-                "not_beacon_counter": not_beacon_counter,
-            }
-        )
+                _kv_cache_args.update(
+                    {
+                        "beacon_mask": beacon_mask,
+                        "not_beacon_counter": not_beacon_counter,
+                    }
+                )
         x = self.embed_tokens(input_ids.unsqueeze(0))
         for i, block in enumerate(self.blocks):
             x = block(
@@ -440,7 +441,7 @@ class Transformer(nn.Module):
         self,
         input_ids: torch.Tensor,
         max_new_tokens: int,
-        is_beacon: bool = False,
+        use_beacon: bool = False,
     ):
         assert input_ids.ndim == 1, "input_ids must be a 1D tensor"
         # pre-allocate KV cache
@@ -453,19 +454,18 @@ class Transformer(nn.Module):
             beacon_stride=self.beacon_stride,
             device=input_ids.device,
             dtype=self.embed_tokens.weight.dtype,
+            use_beacon=use_beacon,
         )
         block_mask = create_block_mask(
             input_ids=input_ids,
             bos_id=self.bos_id,
             beacon_id=self.beacon_id,
-            mask_type="beacon_causal_document" if is_beacon else "causal_document",
+            mask_type="beacon_causal_document" if use_beacon else "causal_document",
             decoding=False,
         )
         # Prefill phase
         kv_cache_args = {
             "prefill": True,
-            "beacon_reduction": False,
-            "is_beacon": is_beacon,
         }
         logits, _ = self.forward(
             input_ids, mask=None, kv_cache=kv_cache, kv_cache_args=kv_cache_args
@@ -476,10 +476,7 @@ class Transformer(nn.Module):
         decoded_tokens = torch.cat([decoded_tokens, next_token], dim=0)
         decode_kv_cache_args = {
             "prefill": False,
-            "beacon_reduction": False,
-            "is_beacon": is_beacon,
         }
-
         # Decoding phase
         for i in range(max_new_tokens):
             block_mask = flex_attention.create_block_mask(
@@ -506,7 +503,8 @@ class Transformer(nn.Module):
                     B=None,
                     H=None,
                     Q_LEN=1,
-                    KV_LEN=kv_cache.current_length,
+                    KV_LEN=kv_cache.get_current_beacon_count()
+                    + 1,  # after reducing, there is only beacons in the KV cache
                     device=input_ids.device,
                 )
                 logits, _ = self.forward(
@@ -549,12 +547,12 @@ if __name__ == "__main__":
         [23, 1, 2, 2, 24, 2, 1, 3, 5, 24, 2, 2], device=input_ids.device
     )
     start = time.time()
-    output = model.generate(input_ids, max_new_tokens=16, is_beacon=False)
+    output = model.generate(input_ids, max_new_tokens=16, use_beacon=False)
     print(output)
     print(f"Causal time taken: {time.time() - start} seconds")
 
     start = time.time()
-    output = model.generate(input_ids, max_new_tokens=16, is_beacon=True)
+    output = model.generate(input_ids, max_new_tokens=16, use_beacon=True)
     print(output)
     print(f"Beacon time taken: {time.time() - start} seconds")
 
