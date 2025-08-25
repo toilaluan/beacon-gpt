@@ -502,7 +502,7 @@ class Transformer(nn.Module):
                     kv_cache_args={"prefill": False},
                 )
                 next_tok = torch.argmax(logits[:, -1, :], dim=-1, keepdim=False)
-                decoded_tokens = torch.cat([decoded_tokens, next_tok], dim=0)
+                decoded_tokens = torch.cat([decoded_tokens[:-1], next_tok], dim=0)
                 cur = next_tok
                 kv_cache.merge_to_beacon()
                 continue  # ← important: skip the normal step this iteration
