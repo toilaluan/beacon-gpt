@@ -40,10 +40,10 @@ def tokenize_doc(doc) -> Tuple[np.ndarray, int]:
     tokens = _tokenizer.encode(text, add_special_tokens=False)
     tokens.append(_tokenizer.eos_token_id)
 
-    tokens_array = np.array(tokens, dtype=np.uint16)
+    tokens_array = np.array(tokens, dtype=np.uint32)
 
     # Validate token range
-    if not ((0 <= tokens_array) & (tokens_array < 2**16)).all():
+    if not ((0 <= tokens_array) & (tokens_array < 2**32)).all():
         raise ValueError(
             f"Token IDs exceed uint16 range. Vocab size: {_tokenizer.vocab_size}"
         )

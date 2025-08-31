@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 from torch.nn.attention import flex_attention
 
+flex_attention.flex_attention = torch.compile(flex_attention.flex_attention)
+
 
 class DTypeLinear(nn.Linear):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -15,14 +17,14 @@ class ScaledRMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.zeros(dim))
+        self.weight = nn.Parameter(torch.zeros(1,dim))
 
     def _norm(self, x: torch.Tensor) -> torch.Tensor:
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = self._norm(x.float())
-        y = y * (1.0 + self.weight.float())
+        y = y * (1.0 + self.weight[0].float())
         return y.type_as(x)
 
     def extra_repr(self) -> str:
@@ -472,13 +474,9 @@ class TransformerConfig:
     num_key_value_heads: int
     rms_norm_eps: float = 1e-6
     rope_theta: float = 1_000_000.0
-    torch_dtype: str = "bfloat16"
-    use_cache: bool = True
     initializer_range: float = 0.02
     query_pre_attn_scalar: int = 256
-    final_logit_softcapping: Optional[float] = None
     vocab_size: int = 32000
-    hidden_activation: str = "gelu_pytorch_tanh"
     rope_scaling: Optional[dict] = None
 
 
@@ -491,7 +489,7 @@ class TransformerModel(nn.Module):
         beacon_stride: int = 0,
     ):
         super().__init__()
-        vocab_size = round_up_to_multiple(config.vocab_size, n=16)
+        vocab_size = round_up_to_multiple(config.vocab_size + 1, n=16)
         self.config = config
         self.vocab_size = vocab_size
 
@@ -570,7 +568,7 @@ class TransformerModel(nn.Module):
                 layer_idx=i,
                 kv_cache_args=_kv_args,
             )
-            print(f"layer-{i}(mean={x.mean()}, std={x.std()})")
+            # print(f"layer-{i}(mean={x.mean()}, std={x.std()})")
         x = self.norm(x)
         logits = self.lm_head(x).float()
 
@@ -602,7 +600,6 @@ class TransformerModel(nn.Module):
             dtype=self.embed_tokens.weight.dtype,
             use_beacon=use_beacon,
         )
-
         pre_mask = make_block_mask(
             input_ids=input_ids,
             bos_token_id=self.config.bos_token_id,
@@ -682,13 +679,9 @@ if __name__ == "__main__":
         num_key_value_heads=1,
         rms_norm_eps=1e-6,
         rope_theta=1_000_000.0,
-        torch_dtype="bfloat16",
-        use_cache=True,
         initializer_range=0.02,
         query_pre_attn_scalar=256,
-        final_logit_softcapping=None,
         vocab_size=tokenizer.vocab_size,
-        hidden_activation="gelu_pytorch_tanh",
         rope_scaling=None,
     )
 

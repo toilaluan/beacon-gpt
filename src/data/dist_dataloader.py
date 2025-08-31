@@ -16,7 +16,7 @@ def floor_multiple_of_n(v: int, n: int) -> int:
 
 
 def _load_shard(shard_path: Path, index_path: Path) -> Tuple[np.ndarray, dict]:
-    tokens = np.fromfile(shard_path, dtype=np.uint16)
+    tokens = np.fromfile(shard_path, dtype=np.uint32)
     with open(index_path, "r") as f:
         index = json.load(f)
 
@@ -40,6 +40,9 @@ def distributed_data_generator(
 
     for shard_file, index_file in cycle(zip(shards, indices)):
         tokens, index = _load_shard(shard_file, index_file)
+
+        print(f"Rank {local_rank} processing {shard_file}, {index_file}")
+        print(f"Sample tokens: {tokens[:16]}...{tokens[-16:]}")
 
         batch_tokens = [] if prefix_tokens is None else prefix_tokens
 
