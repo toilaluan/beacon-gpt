@@ -11,6 +11,10 @@ from itertools import cycle
 import random
 
 
+def floor_multiple_of_n(v: int, n: int) -> int:
+    return (v // n) * n
+
+
 def _load_shard(shard_path: Path, index_path: Path) -> Tuple[np.ndarray, dict]:
     tokens = np.fromfile(shard_path, dtype=np.uint16)
     with open(index_path, "r") as f:
@@ -25,6 +29,7 @@ def distributed_data_generator(
     prefix_tokens: Optional[List[int]] = None,
     local_rank: int = 0,
     world_size: int = 1,
+    doc_multiple_of_n: int = 16,
 ) -> Generator[Tensor, None, None]:
 
     shards = glob.glob(str(dataset_path / "shard_*.bin"))[local_rank::world_size]
@@ -43,6 +48,9 @@ def distributed_data_generator(
         for doc_pos in index["documents"]:
             start_doc = doc_pos["start"]
             end_doc = doc_pos["end"]
+            length = end_doc - start_doc
+            length = floor_multiple_of_n(length, doc_multiple_of_n)
+            end_doc = start_doc + length
 
             doc_tokens = tokens[start_doc:end_doc]
 
