@@ -14,7 +14,11 @@ from transformers import AutoTokenizer
 
 from src.data.beacon_injecting import inject_beacon_to_docs
 from src.data.dist_dataloader import distributed_data_generator
-from src.modeling.transformer import TransformerModel, TransformerConfig, make_block_mask
+from src.modeling.transformer import (
+    TransformerModel,
+    TransformerConfig,
+    make_block_mask,
+)
 from src.optimizer.muon import DistAdam, Muon
 from src.utils import visualize_attention_scores
 
@@ -78,6 +82,7 @@ class DistributedConfig:
         self.device = torch.device("cuda", self.rank)
         self.is_master = self.rank == 0
 
+
 def init_distributed():
     dist_cfg = DistributedConfig()
     torch.cuda.set_device(dist_cfg.device)
@@ -130,13 +135,30 @@ def setup_data(cfg: TrainingConfig, dist_cfg: DistributedConfig):
 
 
 def init_model(
-    cfg: TrainingConfig, dist_cfg: DistributedConfig, tokenizer: AutoTokenizer, model_cfg: TransformerConfig
+    cfg: TrainingConfig,
+    dist_cfg: DistributedConfig,
+    tokenizer: AutoTokenizer,
+    model_cfg: TransformerConfig,
 ):
     model = TransformerModel(
         config=model_cfg,
         beacon_token_id=tokenizer.cls_token_id,
         beacon_stride=cfg.beacon_stride,
     ).to(dist_cfg.device)
+
+    try:
+        from safetensors.torch import load
+
+        with open("ckpt/model.safetensors", "rb") as f:
+            state_dict = load(f.read())
+
+        renamed_state_dict = {}
+
+        for k, v in state_dict.items():
+            renamed_state_dict[k.replace("model.", "")] = v
+        model.load_state_dict(renamed_state_dict)
+    except Exception as e:
+        log_master(f"Load ckpt error: {e}")
 
     for m in model.modules():
         if isinstance(m, torch.nn.Embedding):
@@ -150,7 +172,9 @@ def init_model(
     return model
 
 
-def setup_optimizers(model: TransformerModel, cfg: TrainingConfig, tokenizer: AutoTokenizer):
+def setup_optimizers(
+    model: TransformerModel, cfg: TrainingConfig, tokenizer: AutoTokenizer
+):
     hidden_params = [p for p in model.layers.parameters()]
     direct_params = [p for p in model.embed_tokens.parameters()] + [
         p for p in model.lm_head.parameters()
@@ -275,7 +299,7 @@ def main():
         **ARCH_ARGS["gemma-270m"],
         bos_token_id=tokenizer.bos_token_id,
         eos_token_id=tokenizer.eos_token_id,
-        vocab_size=tokenizer.vocab_size
+        vocab_size=tokenizer.vocab_size,
     )
 
     model = init_model(cfg, dist_cfg, tokenizer, model_cfg)

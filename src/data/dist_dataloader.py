@@ -31,7 +31,6 @@ def distributed_data_generator(
     world_size: int = 1,
     doc_multiple_of_n: int = 16,
 ) -> Generator[Tensor, None, None]:
-
     shards = glob.glob(str(dataset_path / "shard_*.bin"))[local_rank::world_size]
     indices = glob.glob(str(dataset_path / "shard_*.idx"))[local_rank::world_size]
 

@@ -2,6 +2,7 @@ import torch
 from torch import Tensor
 import torch.distributed as dist
 
+
 @torch.compile
 def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
     """

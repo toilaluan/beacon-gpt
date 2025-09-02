@@ -1,7 +1,9 @@
 import torch
 
 
-def _inject_beacon_in_doc(doc: torch.Tensor, beacon_id: int, stride: int) -> torch.Tensor:
+def _inject_beacon_in_doc(
+    doc: torch.Tensor, beacon_id: int, stride: int
+) -> torch.Tensor:
     """Insert a beacon after every `stride` tokens. No padding; preserves all tokens."""
     assert doc.ndim == 1
     if stride <= 0:
@@ -11,12 +13,13 @@ def _inject_beacon_in_doc(doc: torch.Tensor, beacon_id: int, stride: int) -> tor
     if n_full == 0:
         return doc
 
-    chunks = doc[: n_full * stride].view(n_full, stride)                  # [n_full, stride]
-    beacons = torch.full((n_full, 1), beacon_id, dtype=doc.dtype, device=doc.device)  # [n_full, 1]
-    interleaved = torch.cat([chunks, beacons], dim=1).reshape(-1)          # [(stride+1)*n_full]
-    remainder = doc[n_full * stride:]                                      # [L - n_full*stride]
+    chunks = doc[: n_full * stride].view(n_full, stride)  # [n_full, stride]
+    beacons = torch.full(
+        (n_full, 1), beacon_id, dtype=doc.dtype, device=doc.device
+    )  # [n_full, 1]
+    interleaved = torch.cat([chunks, beacons], dim=1).reshape(-1)  # [(stride+1)*n_full]
+    remainder = doc[n_full * stride :]  # [L - n_full*stride]
     return torch.cat([interleaved, remainder], dim=0)
-
 
 
 def inject_beacon_to_docs(
