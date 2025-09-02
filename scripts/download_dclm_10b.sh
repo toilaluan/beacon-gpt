@@ -1,0 +1,1 @@
+hf download toilaluan/dclm-10b-tokenized-by-gemma --local-dir ./tokenized_data --repo-type dataset
