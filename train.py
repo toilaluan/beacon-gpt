@@ -158,7 +158,7 @@ def init_model(
             renamed_state_dict[k.replace("model.", "")] = v
         model.load_state_dict(renamed_state_dict)
     except Exception as e:
-        log_master(f"Load ckpt error: {e}")
+        log_master(f"Load ckpt error: {e}", dist_cfg.is_master)
 
     for m in model.modules():
         if isinstance(m, torch.nn.Embedding):
