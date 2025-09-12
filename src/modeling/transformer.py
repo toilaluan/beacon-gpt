@@ -138,8 +138,8 @@ class KVCache:
 
     def get_kv(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         return (
-            self.keys[layer_idx][:, :, : self.current_length, :],
-            self.values[layer_idx][:, :, : self.current_length, :],
+            self.keys[layer_idx],
+            self.values[layer_idx],
         )
 
     def merge_to_beacon(self):
@@ -614,20 +614,23 @@ class TransformerModel(nn.Module):
         decoded = torch.cat([input_ids, next_tok], dim=0)
         cur = next_tok
 
+        offset = 0
+
+        decode_mask = flex_attention.create_block_mask(
+            mask_mod=lambda b, h, q_idx, kv_idx: q_idx + offset >= kv_idx,
+            B=None,
+            H=None,
+            Q_LEN=1,
+            KV_LEN=kv_length,
+            device=cur.device,
+        )
+
         for _ in range(max_new_tokens):
             if kv_cache.need_new_beacon():
-                old_len = kv_cache.current_length
-                beacon_mask = flex_attention.create_block_mask(
-                    mask_mod=lambda b, h, q_idx, kv_idx: old_len + 1 >= kv_idx,
-                    B=None,
-                    H=None,
-                    Q_LEN=1,
-                    KV_LEN=old_len + 1,
-                    device=cur.device,
-                )
+                offset = kv_cache.current_length + 1
                 logits, _ = self.forward(
                     torch.tensor([self.beacon_token_id], device=cur.device),
-                    mask=beacon_mask,
+                    mask=decode_mask,
                     kv_cache=kv_cache,
                     kv_cache_args={"prefill": False},
                 )
@@ -637,17 +640,12 @@ class TransformerModel(nn.Module):
                 kv_cache.merge_to_beacon()
                 continue
 
-            old_len = kv_cache.current_length
-            step_mask = flex_attention.create_block_mask(
-                mask_mod=lambda b, h, q_idx, kv_idx: old_len + 1 >= kv_idx,
-                B=None,
-                H=None,
-                Q_LEN=1,
-                KV_LEN=old_len + 1,
-                device=cur.device,
-            )
+            offset = kv_cache.current_length + 1
             logits, _ = self.forward(
-                cur, mask=step_mask, kv_cache=kv_cache, kv_cache_args={"prefill": False}
+                cur,
+                mask=decode_mask,
+                kv_cache=kv_cache,
+                kv_cache_args={"prefill": False},
             )
             next_tok = torch.argmax(logits[:, -1, :], dim=-1, keepdim=False)
             decoded = torch.cat([decoded, next_tok], dim=0)
@@ -691,30 +689,30 @@ if __name__ == "__main__":
         beacon_stride=16,
     ).to(device)
 
-    try:
-        state_dict = load_file("./ckpt/model.safetensors")
-        renamed_state_dict = {k.replace("model.", ""): v for k, v in state_dict.items()}
-        model.load_state_dict(renamed_state_dict, strict=False)
-    except Exception as e:
-        print(e)
-        raise SystemExit(1)
+    # try:
+    #     state_dict = load_file("./ckpt/model.safetensors")
+    #     renamed_state_dict = {k.replace("model.", ""): v for k, v in state_dict.items()}
+    #     model.load_state_dict(renamed_state_dict, strict=False)
+    # except Exception as e:
+    #     print(e)
+    #     raise SystemExit(1)
 
-    new_vocab = ((tokenizer.vocab_size + num_tok_added + 16) // 16) * 16
-    model.resize_token_embeddings(new_vocab)
-    print(model.embed_tokens.weight.shape)
-    print(model)
+    # new_vocab = ((tokenizer.vocab_size + num_tok_added + 16) // 16) * 16
+    # model.resize_token_embeddings(new_vocab)
+    # print(model.embed_tokens.weight.shape)
+    # print(model)
 
-    input_ids = torch.randint(0, 100, (10,), device=device)
-    labels = torch.randint(0, 100, (10,), device=device)
-    mask = make_block_mask(
-        input_ids=input_ids,
-        bos_token_id=tokenizer.bos_token_id,
-        beacon_token_id=tokenizer.cls_token_id,
-        mask_type="causal_document",
-    )
-    logits, loss = model(input_ids, labels, mask)
-    print(logits.shape)
-    print(loss)
+    # input_ids = torch.randint(0, 100, (10,), device=device)
+    # labels = torch.randint(0, 100, (10,), device=device)
+    # mask = make_block_mask(
+    #     input_ids=input_ids,
+    #     bos_token_id=tokenizer.bos_token_id,
+    #     beacon_token_id=tokenizer.cls_token_id,
+    #     mask_type="causal_document",
+    # )
+    # logits, loss = model(input_ids, labels, mask)
+    # print(logits.shape)
+    # print(loss)
 
     sample_text = "In the US, "
     print("Generation")
@@ -722,6 +720,6 @@ if __name__ == "__main__":
     input_ids = torch.tensor(input_ids, device=device)
     print(input_ids)
 
-    output = model.generate(input_ids, max_new_tokens=4, use_beacon=False)
+    output = model.generate(input_ids, max_new_tokens=80, use_beacon=True)
     print(output)
     print(tokenizer.decode(output))
