@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 from torch.nn.attention import flex_attention
 
-flex_attention.flex_attention = torch.compile(flex_attention.flex_attention)
+# flex_attention.flex_attention = torch.compile(flex_attention.flex_attention)
 
 
 class DTypeLinear(nn.Linear):
@@ -510,7 +510,8 @@ class TransformerModel(nn.Module):
                 for _ in range(config.num_hidden_layers)
             ]
         )
-        # self.lm_head = DTypeLinear(config.hidden_size, vocab_size, bias=False)
+        self.lm_head = DTypeLinear(config.hidden_size, vocab_size, bias=False)
+        self.embed_tokens.weight = self.lm_head.weight
         self.beacon_stride = beacon_stride
         self.beacon_token_id = beacon_token_id
         self.norm = ScaledRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -570,8 +571,8 @@ class TransformerModel(nn.Module):
             )
             # print(f"layer-{i}(mean={x.mean()}, std={x.std()})")
         x = self.norm(x)
-        # logits = self.lm_head(x).float()
-        logits = F.linear(x, self.embed_tokens.weight).float()
+        logits = self.lm_head(x).float()
+        # logits = F.linear(x, self.embed_tokens.weight).float()
 
         loss = None
         if labels is not None:

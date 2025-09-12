@@ -28,11 +28,11 @@ ARCH_ARGS = {
     "gemma-270m": {
         "head_dim": 256,
         "hidden_size": 640,
-        "intermediate_size": 2048,
+        "intermediate_size": 512,
         "max_position_embeddings": 32768,
         "num_attention_heads": 4,
         "num_key_value_heads": 1,
-        "num_hidden_layers": 18,
+        "num_hidden_layers": 4,
         "rms_norm_eps": 1e-6,
         "rope_theta": 1_000_000,
         "initializer_range": 0.02,
@@ -46,9 +46,9 @@ class TrainingConfig:
     train_data_pattern: str = Path("tokenized_data")
     arch_name: str = "gemma-270m"
     pretrained_tokenizer_name: str = "google/gemma-3-270m"
-    batch_size: int = 1 * 1024
+    batch_size: int = 1 * 256
     target_tokens: int = 100_000_000
-    sample_every_n_steps: int = 100
+    sample_every_n_steps: int = 50
     use_beacon: bool = True
     beacon_stride: int = 16
     sample_text: str = "In the US, "
@@ -167,7 +167,7 @@ def init_model(
     for param in model.parameters():
         dist.broadcast(param.detach(), 0)
 
-    model = torch.compile(model, dynamic=False)
+    # model = torch.compile(model, dynamic=False)
 
     return model
 
@@ -355,15 +355,15 @@ def main():
         if step % cfg.sample_every_n_steps == 0 and dist_cfg.is_master:
             sample_output = model.generate(
                 sample_ids[:6].to(dist_cfg.device),
-                max_new_tokens=64,
+                max_new_tokens=32,
                 use_beacon=cfg.use_beacon,
             )
             sample_text = tokenizer.decode(sample_output.cpu().tolist())
             original_text = tokenizer.decode(sample_ids.tolist())
             targets[targets == -100] = tokenizer.cls_token_id
             label_text = tokenizer.decode(targets.tolist())
-            # log_master(f"***ids: {inputs.tolist()}", dist_cfg.is_master)
-            # log_master(f"***targets: {targets.tolist()}", dist_cfg.is_master)
+            log_master(f"***ids: {inputs.tolist()}", dist_cfg.is_master)
+            log_master(f"***targets: {targets.tolist()}", dist_cfg.is_master)
             log_master(
                 f"***sample_output: {sample_output.tolist()}", dist_cfg.is_master
             )
