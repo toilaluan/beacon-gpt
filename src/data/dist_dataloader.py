@@ -30,54 +30,60 @@ def distributed_data_generator(
     local_rank: int = 0,
     world_size: int = 1,
     doc_multiple_of_n: int = 16,
-) -> Generator[Tensor, None, None]:
-    shards = glob.glob(str(dataset_path / "shard_*.bin"))[local_rank::world_size]
-    indices = glob.glob(str(dataset_path / "shard_*.idx"))[local_rank::world_size]
+):
+    shards = sorted(glob.glob(str(dataset_path / "shard_*.bin")))[
+        local_rank::world_size
+    ]
+    indices = sorted(glob.glob(str(dataset_path / "shard_*.idx")))[
+        local_rank::world_size
+    ]
 
-    shards.sort()
-    indices.sort()
+    # freeze the prefix so we don't mutate the caller's list
+    base_prefix = tuple(prefix_tokens) if prefix_tokens is not None else None
+
+    def new_batch():
+        return [] if base_prefix is None else list(base_prefix)
 
     for shard_file, index_file in cycle(zip(shards, indices)):
-        tokens, index = _load_shard(shard_file, index_file)
-
-        print(f"Rank {local_rank} processing {shard_file}, {index_file}")
-        print(f"Sample tokens: {tokens[:16]}...{tokens[-16:]}")
-
-        batch_tokens = [] if prefix_tokens is None else prefix_tokens
+        tokens, index = _load_shard(Path(shard_file), Path(index_file))
+        batch_tokens = new_batch()
 
         random.shuffle(index["documents"])
 
         for doc_pos in index["documents"]:
             start_doc = doc_pos["start"]
             end_doc = doc_pos["end"]
-            length = end_doc - start_doc
-            length = floor_multiple_of_n(length, doc_multiple_of_n)
-            end_doc = start_doc + length
+            length = floor_multiple_of_n(end_doc - start_doc, doc_multiple_of_n)
+            if length <= 0:
+                continue
+            doc_tokens = tokens[start_doc : start_doc + length]
 
-            doc_tokens = tokens[start_doc:end_doc]
-
-            batch_tokens.extend(doc_tokens)
+            # extend safely; batch_tokens is a fresh list for each batch
+            batch_tokens.extend(doc_tokens.tolist())
 
             if len(batch_tokens) >= batch_size:
-                yield torch.tensor(batch_tokens, dtype=torch.int32)[:batch_size]
-                batch_tokens = [] if prefix_tokens is None else prefix_tokens
+                yield torch.tensor(batch_tokens[:batch_size], dtype=torch.long)
+                batch_tokens = new_batch()
 
         if len(batch_tokens) > 0:
-            yield torch.tensor(batch_tokens, dtype=torch.int32)[:batch_size]
+            yield torch.tensor(batch_tokens[:batch_size], dtype=torch.long)
 
 
 if __name__ == "__main__":
     import time
+    from transformers import AutoTokenizer
 
-    dataset_path = Path("data/dclm")
-    batch_size = 48 * 1024
+    dataset_path = Path("./tokenized_data")
+    batch_size = 1 * 1024
     prefix_tokens = [50256]
+    tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-270m")
     iters = 0
     for ids in distributed_data_generator(
         dataset_path, batch_size, prefix_tokens, local_rank=0, world_size=1
     ):
         start = time.perf_counter()
-        print(ids.shape)
+        print(ids[:16])
+        print(tokenizer.decode(ids[:32]))
         print(f"Time taken: {time.perf_counter() - start} seconds")
         if iters > 10:
             break

@@ -319,6 +319,7 @@ def main():
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         if DEBUG_MODE:
+            print("Warning: running debug mode!")
             ids = sample_ids
         else:
             ids = next(train_loader)
