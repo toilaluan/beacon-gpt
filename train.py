@@ -176,9 +176,7 @@ def setup_optimizers(
     model: TransformerModel, cfg: TrainingConfig, tokenizer: AutoTokenizer
 ):
     hidden_params = [p for p in model.layers.parameters()]
-    direct_params = [p for p in model.embed_tokens.parameters()] + [
-        p for p in model.lm_head.parameters()
-    ]
+    direct_params = [p for p in model.embed_tokens.parameters()]
 
     adam_optimizer = DistAdam(
         direct_params,
@@ -269,7 +267,7 @@ def train_step(
     )
 
     _, loss = model(inputs, targets, mask)
-    return loss
+    return loss, inputs, targets
 
 
 def update_lr(optimizers, step, cfg: TrainingConfig):
@@ -325,7 +323,7 @@ def main():
             ids = next(train_loader)
         assert ids.ndim == 1, "ids must be a 1D tensor"
 
-        loss = train_step(model, ids, cfg, dist_cfg, tokenizer)
+        loss, inputs, targets = train_step(model, ids, cfg, dist_cfg, tokenizer)
         loss.backward()
 
         update_lr(optimizers, step, cfg)
@@ -357,12 +355,29 @@ def main():
         if step % cfg.sample_every_n_steps == 0 and dist_cfg.is_master:
             sample_output = model.generate(
                 sample_ids[:6].to(dist_cfg.device),
-                max_new_tokens=32,
+                max_new_tokens=64,
                 use_beacon=cfg.use_beacon,
             )
             sample_text = tokenizer.decode(sample_output.cpu().tolist())
-            log_master(f"Sample text: {sample_text}", dist_cfg.is_master)
-            wandb.log({"sample_text": wandb.Html(f"<pre>{sample_text}</pre>")})
+            original_text = tokenizer.decode(sample_ids.tolist())
+            targets[targets == -100] = tokenizer.cls_token_id
+            label_text = tokenizer.decode(targets.tolist())
+            # log_master(f"***ids: {inputs.tolist()}", dist_cfg.is_master)
+            # log_master(f"***targets: {targets.tolist()}", dist_cfg.is_master)
+            log_master(
+                f"***sample_output: {sample_output.tolist()}", dist_cfg.is_master
+            )
+            log_master(
+                f"***Sample text: {sample_text}\n***Original text: {original_text}\n***Label text: {label_text}",
+                dist_cfg.is_master,
+            )
+            wandb.log(
+                {
+                    "sample_text": wandb.Html(
+                        f"<pre>Sample text: {sample_text}\nOriginal text: {original_text}</pre>"
+                    )
+                }
+            )
 
 
 if __name__ == "__main__":
