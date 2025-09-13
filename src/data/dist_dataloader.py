@@ -22,51 +22,62 @@ def _load_shard(shard_path: Path, index_path: Path) -> Tuple[np.ndarray, dict]:
 
     return tokens, index
 
-
 def distributed_data_generator(
     dataset_path: Path,
     batch_size: int,
     prefix_tokens: Optional[List[int]] = None,
+    postfix_tokens: Optional[List[int]] = None,
     local_rank: int = 0,
     world_size: int = 1,
     doc_multiple_of_n: int = 16,
 ):
-    shards = sorted(glob.glob(str(dataset_path / "shard_*.bin")))[
-        local_rank::world_size
-    ]
-    indices = sorted(glob.glob(str(dataset_path / "shard_*.idx")))[
-        local_rank::world_size
-    ]
+    """
+    Yields 1D torch.long tensors of length <= batch_size.
+    Each document is transformed to: prefix_tokens + doc_tokens + postfix_tokens
+    before concatenation into the running buffer.
 
-    # freeze the prefix so we don't mutate the caller's list
-    base_prefix = tuple(prefix_tokens) if prefix_tokens is not None else None
+    Notes:
+      - We carry over overflow (no token loss).
+      - `doc_multiple_of_n` is applied to the *raw doc body* only.
+    """
+    shards = sorted(glob.glob(str(dataset_path / "shard_*.bin")))[local_rank::world_size]
+    indices = sorted(glob.glob(str(dataset_path / "shard_*.idx")))[local_rank::world_size]
 
-    def new_batch():
-        return [] if base_prefix is None else list(base_prefix)
+    doc_prefix = list(prefix_tokens) if prefix_tokens else []
+    doc_postfix = list(postfix_tokens) if postfix_tokens else []
+
+    buffer: List[int] = []
 
     for shard_file, index_file in cycle(zip(shards, indices)):
         tokens, index = _load_shard(Path(shard_file), Path(index_file))
-        batch_tokens = new_batch()
 
         random.shuffle(index["documents"])
 
         for doc_pos in index["documents"]:
             start_doc = doc_pos["start"]
             end_doc = doc_pos["end"]
+
+            # Truncate the **document body** to a multiple of n
             length = floor_multiple_of_n(end_doc - start_doc, doc_multiple_of_n)
             if length <= 0:
                 continue
-            doc_tokens = tokens[start_doc : start_doc + length]
 
-            # extend safely; batch_tokens is a fresh list for each batch
-            batch_tokens.extend(doc_tokens.tolist())
+            doc_body = tokens[start_doc : start_doc + length].tolist()
 
-            if len(batch_tokens) >= batch_size:
-                yield torch.tensor(batch_tokens[:batch_size], dtype=torch.long)
-                batch_tokens = new_batch()
+            # Wrap each doc: [prefix] + body + [postfix]
+            buffer.extend(doc_prefix)
+            buffer.extend(doc_body)
+            buffer.extend(doc_postfix)
 
-        if len(batch_tokens) > 0:
-            yield torch.tensor(batch_tokens[:batch_size], dtype=torch.long)
+            # Emit full batches; keep overflow for the next batch
+            while len(buffer) >= batch_size:
+                yield torch.tensor(buffer[:batch_size], dtype=torch.long)
+                buffer = buffer[batch_size:]
+
+        # End of shard: flush any remainder (may be shorter than batch_size)
+        if buffer:
+            yield torch.tensor(buffer[:batch_size], dtype=torch.long)
+            buffer = []
 
 
 if __name__ == "__main__":

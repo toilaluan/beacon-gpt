@@ -28,11 +28,11 @@ ARCH_ARGS = {
     "gemma-270m": {
         "head_dim": 256,
         "hidden_size": 640,
-        "intermediate_size": 512,
+        "intermediate_size": 2048,
         "max_position_embeddings": 32768,
         "num_attention_heads": 4,
         "num_key_value_heads": 1,
-        "num_hidden_layers": 4,
+        "num_hidden_layers": 18,
         "rms_norm_eps": 1e-6,
         "rope_theta": 1_000_000,
         "initializer_range": 0.02,
@@ -46,7 +46,7 @@ class TrainingConfig:
     train_data_pattern: str = Path("tokenized_data")
     arch_name: str = "gemma-270m"
     pretrained_tokenizer_name: str = "google/gemma-3-270m"
-    batch_size: int = 1 * 256
+    batch_size: int = 8*1024
     target_tokens: int = 100_000_000
     sample_every_n_steps: int = 50
     use_beacon: bool = True
@@ -113,6 +113,7 @@ def setup_data(cfg: TrainingConfig, dist_cfg: DistributedConfig):
         cfg.train_data_pattern,
         batch_size=cfg.batch_size * dist_cfg.world_size,
         prefix_tokens=[tokenizer.bos_token_id],
+        postfix_tokens=[tokenizer.eos_token_id],
         local_rank=dist_cfg.rank,
         world_size=dist_cfg.world_size,
         doc_multiple_of_n=cfg.beacon_stride,
@@ -358,12 +359,12 @@ def main():
                 max_new_tokens=32,
                 use_beacon=cfg.use_beacon,
             )
-            sample_text = tokenizer.decode(sample_output.cpu().tolist())
-            original_text = tokenizer.decode(sample_ids.tolist())
+            sample_text = tokenizer.decode(sample_output[:80].cpu().tolist())
+            original_text = tokenizer.decode(sample_ids[:80].tolist())
             targets[targets == -100] = tokenizer.cls_token_id
-            label_text = tokenizer.decode(targets.tolist())
-            log_master(f"***ids: {inputs.tolist()}", dist_cfg.is_master)
-            log_master(f"***targets: {targets.tolist()}", dist_cfg.is_master)
+            label_text = tokenizer.decode(targets[:38].tolist())
+            # log_master(f"***ids: {inputs.tolist()}", dist_cfg.is_master)
+            # log_master(f"***targets: {targets.tolist()}", dist_cfg.is_master)
             log_master(
                 f"***sample_output: {sample_output.tolist()}", dist_cfg.is_master
             )
