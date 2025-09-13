@@ -1,0 +1,1 @@
+hf download google/gemma-3-270m model.safetensors --local-dir ckpt

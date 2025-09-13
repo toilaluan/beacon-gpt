@@ -46,7 +46,7 @@ class TrainingConfig:
     train_data_pattern: str = Path("tokenized_data")
     arch_name: str = "gemma-270m"
     pretrained_tokenizer_name: str = "google/gemma-3-270m"
-    batch_size: int = 8*1024
+    batch_size: int = 256
     target_tokens: int = 100_000_000
     sample_every_n_steps: int = 50
     use_beacon: bool = True
@@ -157,9 +157,11 @@ def init_model(
 
         for k, v in state_dict.items():
             renamed_state_dict[k.replace("model.", "")] = v
-        model.load_state_dict(renamed_state_dict)
+        model.load_state_dict(renamed_state_dict, strict=False)
     except Exception as e:
         log_master(f"Load ckpt error: {e}", dist_cfg.is_master)
+
+    model.resize_token_embeddings(tokenizer.vocab_size)
 
     for m in model.modules():
         if isinstance(m, torch.nn.Embedding):
@@ -167,6 +169,8 @@ def init_model(
 
     for param in model.parameters():
         dist.broadcast(param.detach(), 0)
+
+    model.lm_head.weight = model.embed_tokens.weight
 
     # model = torch.compile(model, dynamic=False)
 
@@ -176,8 +180,10 @@ def init_model(
 def setup_optimizers(
     model: TransformerModel, cfg: TrainingConfig, tokenizer: AutoTokenizer
 ):
-    hidden_params = [p for p in model.layers.parameters()]
-    direct_params = [p for p in model.embed_tokens.parameters()]
+    hidden_params = [p for p in model.layers.parameters() if p.dim() >= 2]
+    direct_params = [p for p in model.embed_tokens.parameters()] + [
+        p for p in model.layers.parameters() if p.dim() < 2
+    ]
 
     adam_optimizer = DistAdam(
         direct_params,
@@ -195,6 +201,15 @@ def setup_optimizers(
 
     optimizers = [adam_optimizer, muon_optimizer]
 
+    # optimizers = [
+    #     torch.optim.AdamW(
+    #         model.parameters(),
+    #         lr=cfg.adam_lr,
+    #         betas=cfg.adam_betas,
+    #         eps=cfg.adam_eps,
+    #         weight_decay=cfg.adam_weight_decay,
+    #     )
+    # ]
     for opt in optimizers:
         for group in opt.param_groups:
             group["initial_lr"] = group["lr"]
@@ -211,7 +226,7 @@ def visualize_initial_sample(
     if not dist_cfg.is_master:
         return
 
-    sample = next(train_loader)[:80]
+    sample = next(train_loader)
     log_master(f"Sample IDS: sample.tolist()", dist_cfg.is_master)
     log_master(f"Sample text: {tokenizer.decode(sample.tolist())}", dist_cfg.is_master)
     log_master(
@@ -359,7 +374,7 @@ def main():
                 max_new_tokens=32,
                 use_beacon=cfg.use_beacon,
             )
-            sample_text = tokenizer.decode(sample_output[:80].cpu().tolist())
+            sample_text = tokenizer.decode(sample_output.cpu().tolist())
             original_text = tokenizer.decode(sample_ids[:80].tolist())
             targets[targets == -100] = tokenizer.cls_token_id
             label_text = tokenizer.decode(targets[:38].tolist())
@@ -379,6 +394,15 @@ def main():
                     )
                 }
             )
+            sample_output = model.generate(
+                tokenizer.encode("The capital of ", return_tensors="pt")[0].to(
+                    dist_cfg.device
+                ),
+                max_new_tokens=32,
+                use_beacon=cfg.use_beacon,
+            )
+            sample_text = tokenizer.decode(sample_output.cpu().tolist())
+            log_master(f"***2. Sample text: {sample_text}", dist_cfg.is_master)
 
 
 if __name__ == "__main__":

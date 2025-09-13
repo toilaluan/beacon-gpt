@@ -17,7 +17,7 @@ class ScaledRMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.zeros(1, dim))
+        self.weight = nn.Parameter(torch.zeros(dim))
 
     def _norm(self, x: torch.Tensor) -> torch.Tensor:
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
@@ -369,8 +369,10 @@ class MultiHeadSelfAttention(nn.Module):
                     prefill_length=q.size(2),
                 )
             else:
-                q = self.rotary(q, position=kv_cache.uncompressed_length)
-                k = self.rotary(k, position=kv_cache.uncompressed_length)
+                pos = kv_cache_args.get("position", kv_cache.uncompressed_length)
+                print(pos)
+                q = self.rotary(q, position=pos)
+                k = self.rotary(k, position=pos)
                 kv_cache.update(layer_idx, k, v, prefill=False)
                 k, v = kv_cache.get_kv(layer_idx)
         else:
@@ -489,7 +491,8 @@ class TransformerModel(nn.Module):
         beacon_stride: int = 0,
     ):
         super().__init__()
-        vocab_size = round_up_to_multiple(config.vocab_size + 1, n=16)
+        # vocab_size = round_up_to_multiple(config.vocab_size + 1, n=16)
+        vocab_size = config.vocab_size
         self.config = config
         self.vocab_size = vocab_size
 
@@ -510,24 +513,29 @@ class TransformerModel(nn.Module):
                 for _ in range(config.num_hidden_layers)
             ]
         )
-        self.lm_head = DTypeLinear(config.hidden_size, vocab_size, bias=False)
-        self.embed_tokens.weight = self.lm_head.weight
+        self.lm_head = DTypeLinear(
+            config.hidden_size, round_up_to_multiple(vocab_size + 1, n=16), bias=False
+        )
+        self.lm_head.weight = self.embed_tokens.weight  # tie weights
         self.beacon_stride = beacon_stride
         self.beacon_token_id = beacon_token_id
         self.norm = ScaledRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
+        # self.resize_token_embeddings(vocab_size)
         print(self.embed_tokens.weight.mean(), self.embed_tokens.weight.std())
 
-    def resize_token_embeddings(self, new_num_tokens: int):
+    def resize_token_embeddings(self, n_vocab: int) -> None:
+        rounded_n_vocab = round_up_to_multiple(n_vocab + 1, n=16)
         old_weight = self.embed_tokens.weight
-        if new_num_tokens > self.vocab_size:
-            self.embed_tokens = nn.Embedding(new_num_tokens, self.config.hidden_size)
+        if rounded_n_vocab > self.vocab_size:
+            self.embed_tokens = nn.Embedding(
+                rounded_n_vocab, self.config.hidden_size, device=old_weight.device
+            )
             self.embed_tokens.weight.data[: self.vocab_size] = old_weight
-        elif new_num_tokens < self.vocab_size:
+        elif rounded_n_vocab < self.vocab_size:
             self.embed_tokens.weight.data = self.embed_tokens.weight.data[
-                :new_num_tokens
+                :rounded_n_vocab
             ]
-        self.vocab_size = new_num_tokens
+        self.vocab_size = rounded_n_vocab
 
     def forward(
         self,
@@ -588,106 +596,51 @@ class TransformerModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         max_new_tokens: int,
-        use_beacon: bool = False,
+        use_beacon: bool = True,  # kept for compatibility; only controls mask type
     ):
-        assert input_ids.ndim == 1
-        kv_length = round_up_to_multiple(input_ids.size(0) + max_new_tokens, n=16)
-        kv_cache = KVCache(
-            num_hidden_layers=self.config.num_hidden_layers,
-            head_dim=self.config.head_dim,
-            num_key_value_heads=self.config.num_key_value_heads,
-            max_position_embeddings=kv_length,
-            beacon_stride=self.beacon_stride,
-            device=input_ids.device,
-            dtype=self.embed_tokens.weight.dtype,
-            use_beacon=use_beacon,
-        )
+        """
+        Greedy generation without KV cache.
+        Each step builds a full prefill-style block mask over the *entire* sequence
+        and runs a full forward pass to predict the next token.
+        """
+        assert input_ids.ndim == 1, "expect 1D tensor of token ids"
+        device = input_ids.device
+        decoded = input_ids.clone()
 
-        # Check if input already has beacon tokens
-        has_beacon = (input_ids == self.beacon_token_id).any() if use_beacon else False
-
-        pre_mask = make_block_mask(
-            input_ids=input_ids,
-            bos_token_id=self.config.bos_token_id,
-            beacon_token_id=self.beacon_token_id,
-            mask_type="beacon_causal_document" if has_beacon else "causal_document",
-            decoding=False,
-        )
-
-        logits, _ = self.forward(
-            input_ids, mask=pre_mask, kv_cache=kv_cache, kv_cache_args={"prefill": True}
-        )
-        next_tok = torch.argmax(logits[:, -1, :], dim=-1, keepdim=False)
-        decoded = torch.cat([input_ids, next_tok], dim=0)
-        cur = next_tok
-
-        print(f"First generated token: {next_tok.item()}")
-
-        # Check for early termination
-        if next_tok.item() == self.config.eos_token_id:
-            return decoded
-
-        for _ in range(max_new_tokens - 1):  # -1 because we already generated one token
-            if kv_cache.need_new_beacon():
-                old_len = kv_cache.current_length
-                # Generate beacon token
-                decode_mask = flex_attention.create_block_mask(
-                    mask_mod=lambda b, h, q_idx, kv_idx: old_len >= kv_idx,
-                    B=None,
-                    H=None,
-                    Q_LEN=1,
-                    KV_LEN=kv_length,
-                    device=cur.device,
+        with torch.inference_mode():
+            for _ in range(max_new_tokens):
+                # Decide mask type based on whether the sequence currently has beacon tokens
+                has_beacon = bool(
+                    use_beacon and (decoded == self.beacon_token_id).any()
                 )
 
-                beacon_tok = torch.tensor([self.beacon_token_id], device=cur.device)
+                block_mask = make_block_mask(
+                    input_ids=decoded,
+                    bos_token_id=self.config.bos_token_id,
+                    beacon_token_id=self.beacon_token_id,
+                    mask_type="beacon_causal_document"
+                    if has_beacon
+                    else "causal_document",
+                    decoding=False,  # full prefill-style attention
+                    return_block_mask=True,
+                )
+
+                # Full forward over current sequence; no kv_cache
                 logits, _ = self.forward(
-                    beacon_tok,
-                    mask=decode_mask,
-                    kv_cache=kv_cache,
-                    kv_cache_args={"prefill": False},
+                    decoded,
+                    labels=None,
+                    mask=block_mask,
+                    kv_cache=None,
+                    kv_cache_args=None,
                 )
 
-                # The beacon itself might not be added to output (depends on your design)
-                # If you want beacons in output: decoded = torch.cat([decoded, beacon_tok], dim=0)
+                # Greedy next token
+                next_tok = torch.argmax(logits[:, -1, :], dim=-1)  # shape [1]
+                decoded = torch.cat([decoded, next_tok], dim=0)
 
-                # Now generate the actual next token after beacon
-                next_tok = torch.argmax(logits[:, -1, :], dim=-1, keepdim=False)
-                decoded = torch.cat([decoded[:-1], next_tok], dim=0)
-                cur = next_tok
-
-                # Merge beacon in cache
-                kv_cache.merge_to_beacon()
-
-                # Check for EOS
-                if next_tok.item() == self.config.eos_token_id:
+                # Optional early stop on EOS
+                if int(next_tok.item()) == self.config.eos_token_id:
                     break
-                continue
-
-            # Regular generation (no beacon needed)
-            old_len = kv_cache.current_length
-            decode_mask = flex_attention.create_block_mask(
-                mask_mod=lambda b, h, q_idx, kv_idx: old_len >= kv_idx,
-                B=None,
-                H=None,
-                Q_LEN=1,
-                KV_LEN=kv_length,
-                device=cur.device,
-            )
-
-            logits, _ = self.forward(
-                cur,
-                mask=decode_mask,
-                kv_cache=kv_cache,
-                kv_cache_args={"prefill": False},
-            )
-            next_tok = torch.argmax(logits[:, -1, :], dim=-1, keepdim=False)
-            decoded = torch.cat([decoded, next_tok], dim=0)
-            cur = next_tok
-
-            # Check for EOS
-            # if next_tok.item() == self.config.eos_token_id:
-            #     break
 
         return decoded
 
