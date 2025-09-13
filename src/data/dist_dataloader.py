@@ -49,6 +49,7 @@ def distributed_data_generator(
     buffer: List[int] = []
 
     for shard_file, index_file in cycle(zip(shards, indices)):
+        print(f"Loading new shard: {shard_file}")
         tokens, index = _load_shard(Path(shard_file), Path(index_file))
 
         random.shuffle(index["documents"])
@@ -72,7 +73,7 @@ def distributed_data_generator(
             # Emit full batches; keep overflow for the next batch
             while len(buffer) >= batch_size:
                 yield torch.tensor(buffer[:batch_size], dtype=torch.long)
-                buffer = buffer[batch_size:]
+                buffer = []
 
         # End of shard: flush any remainder (may be shorter than batch_size)
         if buffer:

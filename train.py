@@ -26,13 +26,13 @@ DEBUG_MODE = os.getenv("TRAIN_MODE") == "overfit"
 
 ARCH_ARGS = {
     "gemma-270m": {
-        "head_dim": 256,
-        "hidden_size": 640,
+        "head_dim": 128,
+        "hidden_size": 512,
         "intermediate_size": 2048,
         "max_position_embeddings": 32768,
         "num_attention_heads": 4,
-        "num_key_value_heads": 1,
-        "num_hidden_layers": 18,
+        "num_key_value_heads": 4,
+        "num_hidden_layers": 12,
         "rms_norm_eps": 1e-6,
         "rope_theta": 1_000_000,
         "initializer_range": 0.02,
@@ -46,9 +46,9 @@ class TrainingConfig:
     train_data_pattern: str = Path("tokenized_data")
     arch_name: str = "gemma-270m"
     pretrained_tokenizer_name: str = "google/gemma-3-270m"
-    batch_size: int = 256
+    batch_size: int = 16*1024
     target_tokens: int = 100_000_000
-    sample_every_n_steps: int = 50
+    sample_every_n_steps: int = 200
     use_beacon: bool = True
     beacon_stride: int = 16
     sample_text: str = "In the US, "
@@ -134,6 +134,40 @@ def setup_data(cfg: TrainingConfig, dist_cfg: DistributedConfig):
 
     return tokenizer, train_loader, sample_text_ids
 
+def print_model_size(model):
+    """
+    Print detailed information about PyTorch model size including:
+    - Total parameters
+    - Trainable parameters
+    - Non-trainable parameters
+    - Model size in MB
+    """
+    # Calculate total parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    
+    # Calculate trainable parameters
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    # Calculate non-trainable parameters
+    non_trainable_params = total_params - trainable_params
+    
+    # Calculate model size in bytes (assuming float32, 4 bytes per parameter)
+    param_size = total_params * 4
+    buffer_size = sum(buf.numel() * 4 for buf in model.buffers())
+    total_size = param_size + buffer_size
+    
+    # Convert to MB
+    size_mb = total_size / (1024 * 1024)
+    
+    print("="*50)
+    print("MODEL SIZE SUMMARY")
+    print("="*50)
+    print(f"Total parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
+    print(f"Non-trainable parameters: {non_trainable_params:,}")
+    print(f"Model size: {size_mb:.2f} MB")
+    print("="*50)
+
 
 def init_model(
     cfg: TrainingConfig,
@@ -161,7 +195,7 @@ def init_model(
     except Exception as e:
         log_master(f"Load ckpt error: {e}", dist_cfg.is_master)
 
-    model.resize_token_embeddings(tokenizer.vocab_size)
+    # model.resize_token_embeddings(tokenizer.vocab_size)
 
     for m in model.modules():
         if isinstance(m, torch.nn.Embedding):
@@ -170,9 +204,12 @@ def init_model(
     for param in model.parameters():
         dist.broadcast(param.detach(), 0)
 
-    model.lm_head.weight = model.embed_tokens.weight
+    # model.lm_head.weight = model.embed_tokens.weight
 
-    # model = torch.compile(model, dynamic=False)
+    if dist_cfg.is_master:
+        print_model_size(model)
+
+    model = torch.compile(model, dynamic=False)
 
     return model
 
@@ -226,7 +263,7 @@ def visualize_initial_sample(
     if not dist_cfg.is_master:
         return
 
-    sample = next(train_loader)
+    sample = next(train_loader)[:80]
     log_master(f"Sample IDS: sample.tolist()", dist_cfg.is_master)
     log_master(f"Sample text: {tokenizer.decode(sample.tolist())}", dist_cfg.is_master)
     log_master(
@@ -369,6 +406,7 @@ def main():
             )
 
         if step % cfg.sample_every_n_steps == 0 and dist_cfg.is_master:
+            print(inputs.shape)
             sample_output = model.generate(
                 sample_ids[:6].to(dist_cfg.device),
                 max_new_tokens=32,

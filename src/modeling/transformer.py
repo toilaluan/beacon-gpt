@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 from torch.nn.attention import flex_attention
 
-# flex_attention.flex_attention = torch.compile(flex_attention.flex_attention)
+flex_attention.flex_attention = torch.compile(flex_attention.flex_attention)
 
 
 class DTypeLinear(nn.Linear):
@@ -491,8 +491,8 @@ class TransformerModel(nn.Module):
         beacon_stride: int = 0,
     ):
         super().__init__()
-        # vocab_size = round_up_to_multiple(config.vocab_size + 1, n=16)
-        vocab_size = config.vocab_size
+        vocab_size = round_up_to_multiple(config.vocab_size + 1, n=16)
+        # vocab_size = config.vocab_size
         self.config = config
         self.vocab_size = vocab_size
 
@@ -514,12 +514,13 @@ class TransformerModel(nn.Module):
             ]
         )
         self.lm_head = DTypeLinear(
-            config.hidden_size, round_up_to_multiple(vocab_size + 1, n=16), bias=False
+            config.hidden_size,vocab_size, bias=False
         )
-        self.lm_head.weight = self.embed_tokens.weight  # tie weights
+        # self.lm_head.weight = self.embed_tokens.weight  # tie weights
         self.beacon_stride = beacon_stride
         self.beacon_token_id = beacon_token_id
         self.norm = ScaledRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.embed_tokens.weight = self.lm_head.weight
         # self.resize_token_embeddings(vocab_size)
         print(self.embed_tokens.weight.mean(), self.embed_tokens.weight.std())
 
