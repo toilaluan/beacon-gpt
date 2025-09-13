@@ -592,6 +592,7 @@ class TransformerModel(nn.Module):
             )
         return logits, loss
 
+    @torch.no_grad()
     def generate(
         self,
         input_ids: torch.Tensor,
