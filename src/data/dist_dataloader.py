@@ -1,14 +1,14 @@
-import torch
-import torch.distributed as dist
-from torch import Tensor
-from pathlib import Path
-import glob
-import numpy as np
-from typing import Tuple
+import time
 import json
-from typing import Optional, List, Generator
-from itertools import cycle
+import glob
 import random
+from pathlib import Path
+from typing import Tuple, Optional, List, Generator
+from collections import deque
+
+import numpy as np
+import torch
+from torch import Tensor
 
 
 def floor_multiple_of_n(v: int, n: int) -> int:
@@ -19,8 +19,16 @@ def _load_shard(shard_path: Path, index_path: Path) -> Tuple[np.ndarray, dict]:
     tokens = np.fromfile(shard_path, dtype=np.uint32)
     with open(index_path, "r") as f:
         index = json.load(f)
-
     return tokens, index
+
+
+def _deterministic_shuffle(items: List, seed: int) -> List:
+    """Return a deterministically shuffled *copy* of items."""
+    out = list(items)
+    rng = random.Random(seed)
+    rng.shuffle(out)
+    return out
+
 
 def distributed_data_generator(
     dataset_path: Path,
@@ -29,74 +37,118 @@ def distributed_data_generator(
     postfix_tokens: Optional[List[int]] = None,
     local_rank: int = 0,
     world_size: int = 1,
-    doc_multiple_of_n: int = 16,
-):
+    doc_multiple_of_n: int = 1,
+    base_seed: int = 0,
+) -> Generator[Tensor, None, None]:
     """
-    Yields 1D torch.long tensors of length <= batch_size.
-    Each document is transformed to: prefix_tokens + doc_tokens + postfix_tokens
-    before concatenation into the running buffer.
+    Yields 1D torch.long tensors of length == batch_size for the given local_rank.
+    Scheduling:
+      - Each document becomes: prefix + doc_body + postfix.
+      - Documents are assigned round-robin to rank buffers [0..world_size-1].
+      - When *all* buffers have >= batch_size tokens, emit exactly batch_size
+        from each (carry-over kept), returning only local_rank's slice.
 
     Notes:
-      - We carry over overflow (no token loss).
-      - `doc_multiple_of_n` is applied to the *raw doc body* only.
+      - `doc_multiple_of_n` applies to the *raw document body* only.
+      - Deterministic shuffle per (epoch, shard) ensures each rank sees the same
+        document order and thus different (but aligned) slices by rank.
     """
-    shards = sorted(glob.glob(str(dataset_path / "shard_*.bin")))[local_rank::world_size]
-    indices = sorted(glob.glob(str(dataset_path / "shard_*.idx")))[local_rank::world_size]
+    assert world_size >= 1, "world_size must be >= 1"
+    assert 0 <= local_rank < world_size, "local_rank must be in [0, world_size)"
+
+    shards = sorted(glob.glob(str(dataset_path / "shard_*.bin")))
+    indices = sorted(glob.glob(str(dataset_path / "shard_*.idx")))
+    assert shards and indices and len(shards) == len(indices), "Missing shards or indices"
 
     doc_prefix = list(prefix_tokens) if prefix_tokens else []
     doc_postfix = list(postfix_tokens) if postfix_tokens else []
 
-    buffer: List[int] = []
+    # Independent per-rank buffers with O(1) popleft for carry-over handling
+    buffers = [deque() for _ in range(world_size)]
 
-    for shard_file, index_file in cycle(zip(shards, indices)):
-        print(f"Loading new shard: {shard_file}")
-        tokens, index = _load_shard(Path(shard_file), Path(index_file))
+    rr = 0                     # round-robin assignment pointer
+    epoch = 0                  # increases each full pass over all shards
 
-        random.shuffle(index["documents"])
+    while True:
+        for shard_i, (shard_file, index_file) in enumerate(zip(shards, indices)):
+            print(f"[rank {local_rank}] Loading shard: {shard_file}")
+            t0 = time.time()
+            tokens, index = _load_shard(Path(shard_file), Path(index_file))
+            print(f"[rank {local_rank}] Load time: {time.time() - t0:.3f}s")
 
-        for doc_pos in index["documents"]:
-            start_doc = doc_pos["start"]
-            end_doc = doc_pos["end"]
+            # Deterministic per-(epoch, shard) shuffle
+            docs = index["documents"]
+            seed = (base_seed << 32) ^ (epoch * 1315423911) ^ (shard_i * 2654435761)
+            docs = _deterministic_shuffle(docs, seed)
 
-            # Truncate the **document body** to a multiple of n
-            length = floor_multiple_of_n(end_doc - start_doc, doc_multiple_of_n)
-            if length <= 0:
-                continue
+            for doc_pos in docs:
+                start_doc = int(doc_pos["start"])
+                end_doc = int(doc_pos["end"])
+                raw_len = end_doc - start_doc
+                if raw_len <= 0:
+                    continue
 
-            doc_body = tokens[start_doc : start_doc + length].tolist()
+                body_len = raw_len
+                if doc_multiple_of_n > 1:
+                    body_len = floor_multiple_of_n(body_len, doc_multiple_of_n)
+                    if body_len <= 0:
+                        continue
 
-            # Wrap each doc: [prefix] + body + [postfix]
-            buffer.extend(doc_prefix)
-            buffer.extend(doc_body)
-            buffer.extend(doc_postfix)
+                # Build the wrapped document tokens for the current rr buffer
+                if doc_prefix:
+                    buffers[rr].extend(doc_prefix)
 
-            # Emit full batches; keep overflow for the next batch
-            while len(buffer) >= batch_size:
-                yield torch.tensor(buffer[:batch_size], dtype=torch.long)
-                buffer = []
+                # Extend with body (keep as ints; np.uint32 -> Python int)
+                buffers[rr].extend(map(int, tokens[start_doc : start_doc + body_len]))
 
-        # End of shard: flush any remainder (may be shorter than batch_size)
-        if buffer:
-            yield torch.tensor(buffer[:batch_size], dtype=torch.long)
-            buffer = []
+                if doc_postfix:
+                    buffers[rr].extend(doc_postfix)
+
+                # Advance RR pointer
+                rr += 1
+                if rr == world_size:
+                    rr = 0
+
+                # If all buffers are ready, emit a synchronized pack
+                if all(len(b) >= batch_size for b in buffers):
+                    local_out = None
+                    for r in range(world_size):
+                        # Pop exactly batch_size to keep overflow for next pack
+                        chunk = [buffers[r].popleft() for _ in range(batch_size)]
+                        if r == local_rank:
+                            local_out = chunk
+                    # Guaranteed to be set because world_size >= 1
+                    yield torch.tensor(local_out, dtype=torch.long)
+
+        epoch += 1
 
 
 if __name__ == "__main__":
-    import time
     from transformers import AutoTokenizer
 
     dataset_path = Path("./tokenized_data")
-    batch_size = 1 * 1024
-    prefix_tokens = [50256]
+    batch_size = 1024
+    prefix_tokens = [50256]           # e.g., BOS
+    postfix_tokens = []               # optional
+
+    # Example: simulate rank 0 of 4. Launch 4 procs with local_rank=0..3 for real use.
+    local_rank = 0
+    world_size = 4
+
     tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-270m")
     iters = 0
     for ids in distributed_data_generator(
-        dataset_path, batch_size, prefix_tokens, local_rank=0, world_size=1
+        dataset_path=dataset_path,
+        batch_size=batch_size,
+        prefix_tokens=prefix_tokens,
+        postfix_tokens=postfix_tokens,
+        local_rank=local_rank,
+        world_size=world_size,
+        doc_multiple_of_n=16,
+        base_seed=1234,   # set the same across ranks for aligned ordering
     ):
-        start = time.perf_counter()
         print(ids[:16])
         print(tokenizer.decode(ids[:32]))
-        print(f"Time taken: {time.perf_counter() - start} seconds")
         if iters > 10:
             break
         iters += 1
