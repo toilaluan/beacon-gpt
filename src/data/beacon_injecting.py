@@ -12,7 +12,6 @@ def _inject_beacon_in_doc(
     n_full = L // stride
     if n_full == 0:
         return doc
-
     chunks = doc[: n_full * stride].view(n_full, stride)  # [n_full, stride]
     beacons = torch.full(
         (n_full, 1), beacon_id, dtype=doc.dtype, device=doc.device
@@ -29,6 +28,7 @@ def inject_beacon_to_docs(
     assert input_ids.ndim == 1, "input_ids must be a 1D tensor"
 
     bos_idxs = torch.nonzero(input_ids == bos_id, as_tuple=False).squeeze(1)
+    # print(bos_idxs, input_ids[:16], bos_id)
 
     if len(bos_idxs) <= 1:
         return _inject_beacon_in_doc(input_ids, beacon_id, stride)

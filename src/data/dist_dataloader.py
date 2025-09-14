@@ -62,12 +62,7 @@ def distributed_data_generator(
 
     doc_prefix = list(prefix_tokens) if prefix_tokens else []
     doc_postfix = list(postfix_tokens) if postfix_tokens else []
-
-    # Independent per-rank buffers with O(1) popleft for carry-over handling
-    buffers = [deque() for _ in range(world_size)]
-
-    rr = 0                     # round-robin assignment pointer
-    epoch = 0                  # increases each full pass over all shards
+    epoch = 0
 
     while True:
         for shard_i, (shard_file, index_file) in enumerate(zip(shards, indices)):
@@ -81,6 +76,11 @@ def distributed_data_generator(
             seed = (base_seed << 32) ^ (epoch * 1315423911) ^ (shard_i * 2654435761)
             docs = _deterministic_shuffle(docs, seed)
 
+            rank_starts = [[] for _ in range(world_size)]
+            rank_lengths = [0] * world_size
+
+            processing_rank = 0
+
             for doc_pos in docs:
                 start_doc = int(doc_pos["start"])
                 end_doc = int(doc_pos["end"])
@@ -93,32 +93,25 @@ def distributed_data_generator(
                     body_len = floor_multiple_of_n(body_len, doc_multiple_of_n)
                     if body_len <= 0:
                         continue
-
-                # Build the wrapped document tokens for the current rr buffer
-                if doc_prefix:
-                    buffers[rr].extend(doc_prefix)
-
-                # Extend with body (keep as ints; np.uint32 -> Python int)
-                buffers[rr].extend(map(int, tokens[start_doc : start_doc + body_len]))
-
-                if doc_postfix:
-                    buffers[rr].extend(doc_postfix)
-
-                # Advance RR pointer
-                rr += 1
-                if rr == world_size:
-                    rr = 0
-
-                # If all buffers are ready, emit a synchronized pack
-                if all(len(b) >= batch_size for b in buffers):
-                    local_out = None
-                    for r in range(world_size):
-                        # Pop exactly batch_size to keep overflow for next pack
-                        chunk = [buffers[r].popleft() for _ in range(batch_size)]
-                        if r == local_rank:
-                            local_out = chunk
-                    # Guaranteed to be set because world_size >= 1
-                    yield torch.tensor(local_out, dtype=torch.long)
+                rank_starts[processing_rank].append((start_doc, body_len))
+                rank_lengths[processing_rank] += body_len
+                
+                if rank_lengths[processing_rank] > batch_size:
+                    processing_rank += 1
+                else:
+                    continue
+                if processing_rank == world_size:
+                    # print("Local rank x", local_rank)
+                    local_rank_docs = [tokens[start:start+length] for start, length in rank_starts[local_rank]]
+                    return_ids = []
+                    for doc in local_rank_docs:
+                        return_ids.extend(doc_prefix)
+                        return_ids.extend(doc)
+                        return_ids.extend(doc_postfix)
+                    yield torch.tensor(return_ids, dtype=torch.int32)
+                    rank_starts = [[] for _ in range(world_size)]
+                    rank_lengths = [0] * world_size
+                    processing_rank = 0
 
         epoch += 1
 
@@ -127,7 +120,7 @@ if __name__ == "__main__":
     from transformers import AutoTokenizer
 
     dataset_path = Path("./tokenized_data")
-    batch_size = 1024
+    batch_size = 16*1024
     prefix_tokens = [50256]           # e.g., BOS
     postfix_tokens = []               # optional
 
@@ -139,16 +132,15 @@ if __name__ == "__main__":
     iters = 0
     for ids in distributed_data_generator(
         dataset_path=dataset_path,
-        batch_size=batch_size,
+        batch_size=batch_size+128,
         prefix_tokens=prefix_tokens,
         postfix_tokens=postfix_tokens,
-        local_rank=local_rank,
-        world_size=world_size,
+        local_rank=2,
+        world_size=8,
         doc_multiple_of_n=16,
         base_seed=1234,   # set the same across ranks for aligned ordering
     ):
-        print(ids[:16])
-        print(tokenizer.decode(ids[:32]))
+        print(ids.shape)
         if iters > 10:
             break
         iters += 1

@@ -111,7 +111,7 @@ def setup_data(cfg: TrainingConfig, dist_cfg: DistributedConfig):
     n = tokenizer.add_special_tokens({"cls_token": "<|beacon|>"})
     train_loader = distributed_data_generator(
         cfg.train_data_pattern,
-        batch_size=cfg.batch_size * dist_cfg.world_size,
+        batch_size=cfg.batch_size + 128,
         prefix_tokens=[tokenizer.bos_token_id],
         postfix_tokens=[tokenizer.eos_token_id],
         local_rank=dist_cfg.rank,
@@ -300,6 +300,7 @@ def train_step(
     dist_cfg: DistributedConfig,
     tokenizer: AutoTokenizer,
 ):
+    # before_shape = ids.shape
     if cfg.use_beacon:
         ids = inject_beacon_to_docs(
             ids,
@@ -308,9 +309,12 @@ def train_step(
             stride=cfg.beacon_stride,
         )
 
+    # logger.info(f"Rank: {dist_cfg.rank}, {before_shape} -> {ids.shape}")
+
     ids = ids[: cfg.batch_size + 1]
     inputs = ids[:-1].to(dist_cfg.device, dtype=torch.int32)
     targets = ids[1:].to(dist_cfg.device, dtype=torch.int64)
+    # logger.info(f"{dist_cfg.rank}, {inputs.shape}, {cfg.batch_size}")
     targets[targets == tokenizer.cls_token_id] = -100
     mask = make_block_mask(
         input_ids=inputs,
@@ -362,6 +366,7 @@ def main():
     total_step_time_ms = 0.0
 
     sample_ids = next(train_loader)
+    print(f"Sample from rank: {dist_cfg.rank}, {sample_ids[:16]}")
 
     max_steps = cfg.target_tokens // (cfg.batch_size * dist_cfg.world_size)
     cfg.max_steps = max_steps
@@ -375,6 +380,8 @@ def main():
         else:
             ids = next(train_loader)
         assert ids.ndim == 1, "ids must be a 1D tensor"
+
+        assert len(ids) >= cfg.batch_size, "ids length != batch_size"
 
         loss, inputs, targets = train_step(model, ids, cfg, dist_cfg, tokenizer)
         loss.backward()
