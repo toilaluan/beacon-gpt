@@ -19,7 +19,10 @@ from src.modeling.transformer import (
     TransformerConfig,
     make_block_mask,
 )
-from src.optimizer.muon import DistAdam, Muon
+from torch import autocast
+from torch.cuda.amp import GradScaler
+from torch.nn.parallel import DistributedDataParallel as DDP
+from muon import MuonWithAuxAdam
 from src.utils import visualize_attention_scores
 
 DEBUG_MODE = os.getenv("TRAIN_MODE") == "overfit"
@@ -181,30 +184,7 @@ def init_model(
         beacon_stride=cfg.beacon_stride,
     ).to(dist_cfg.device)
 
-    try:
-        from safetensors.torch import load
-
-        with open("ckpt/model.safetensors", "rb") as f:
-            state_dict = load(f.read())
-
-        renamed_state_dict = {}
-
-        for k, v in state_dict.items():
-            renamed_state_dict[k.replace("model.", "")] = v
-        model.load_state_dict(renamed_state_dict, strict=False)
-    except Exception as e:
-        log_master(f"Load ckpt error: {e}", dist_cfg.is_master)
-
-    # model.resize_token_embeddings(tokenizer.vocab_size)
-
-    for m in model.modules():
-        if isinstance(m, torch.nn.Embedding):
-            m.bfloat16()
-
-    for param in model.parameters():
-        dist.broadcast(param.detach(), 0)
-
-    # model.lm_head.weight = model.embed_tokens.weight
+    model = DDP(model, device_ids=[dist_cfg.device])
 
     if dist_cfg.is_master:
         print_model_size(model)
@@ -214,45 +194,18 @@ def init_model(
     return model
 
 
-def setup_optimizers(
+def setup_optimizer(
     model: TransformerModel, cfg: TrainingConfig, tokenizer: AutoTokenizer
 ):
     hidden_params = [p for p in model.layers.parameters() if p.dim() >= 2]
     direct_params = [p for p in model.embed_tokens.parameters()] + [
         p for p in model.layers.parameters() if p.dim() < 2
     ]
-
-    adam_optimizer = DistAdam(
-        direct_params,
-        lr=cfg.adam_lr,
-        betas=cfg.adam_betas,
-        eps=cfg.adam_eps,
-        weight_decay=cfg.adam_weight_decay,
-    )
-    muon_optimizer = Muon(
-        hidden_params,
-        lr=cfg.muon_lr,
-        weight_decay=cfg.muon_weight_decay,
-        momentum=cfg.muon_momentum,
-    )
-
-    optimizers = [adam_optimizer, muon_optimizer]
-
-    # optimizers = [
-    #     torch.optim.AdamW(
-    #         model.parameters(),
-    #         lr=cfg.adam_lr,
-    #         betas=cfg.adam_betas,
-    #         eps=cfg.adam_eps,
-    #         weight_decay=cfg.adam_weight_decay,
-    #     )
-    # ]
-    for opt in optimizers:
-        for group in opt.param_groups:
-            group["initial_lr"] = group["lr"]
-
-    return optimizers
-
+    param_groups = [
+        {"params": hidden_params, "lr": cfg.muon_lr, "weight_decay": cfg.muon_weight_decay, "momentum": cfg.muon_momentum},
+        {"params": direct_params, "lr": cfg.adam_lr, "betas": cfg.adam_betas, "eps": cfg.adam_eps, "weight_decay": cfg.adam_weight_decay},
+    ]
+    return MuonWithAuxAdam(param_groups)
 
 def visualize_initial_sample(
     train_loader,
@@ -310,11 +263,11 @@ def train_step(
         )
 
     # logger.info(f"Rank: {dist_cfg.rank}, {before_shape} -> {ids.shape}")
-
+    # TODO: make sure that w & w/o beacons, amount of labels are the same to be comparable
     ids = ids[: cfg.batch_size + 1]
     inputs = ids[:-1].to(dist_cfg.device, dtype=torch.int32)
     targets = ids[1:].to(dist_cfg.device, dtype=torch.int64)
-    # logger.info(f"{dist_cfg.rank}, {inputs.shape}, {cfg.batch_size}")
+    logger.info(f"{dist_cfg.rank}, {inputs.shape}, {cfg.batch_size}")
     targets[targets == tokenizer.cls_token_id] = -100
     mask = make_block_mask(
         input_ids=inputs,
@@ -323,7 +276,8 @@ def train_step(
         mask_type="beacon_causal_document" if cfg.use_beacon else "causal_document",
     )
 
-    _, loss = model(inputs, targets, mask)
+    with autocast(device_type=dist_cfg.device.type, dtype=torch.bfloat16):
+        _, loss = model(inputs, targets, mask)
     return loss, inputs, targets
 
 
@@ -359,8 +313,8 @@ def main():
 
     model = init_model(cfg, dist_cfg, tokenizer, model_cfg)
     log_master(model, dist_cfg.is_master)
-    optimizers = setup_optimizers(model, cfg, tokenizer)
-
+    optimizer = setup_optimizer(model, cfg, tokenizer)
+    scaler = GradScaler()
     visualize_initial_sample(train_loader, cfg, dist_cfg, tokenizer)
 
     total_step_time_ms = 0.0
@@ -384,12 +338,12 @@ def main():
         assert len(ids) >= cfg.batch_size, "ids length != batch_size"
 
         loss, inputs, targets = train_step(model, ids, cfg, dist_cfg, tokenizer)
-        loss.backward()
+        scaler.scale(loss).backward()
 
-        update_lr(optimizers, step, cfg)
+        update_lr(optimizer, step, cfg)
 
-        for opt in optimizers:
-            opt.step()
+        scaler.step(optimizer)
+        scaler.update()
 
         model.zero_grad(set_to_none=True)
 
@@ -423,8 +377,6 @@ def main():
             original_text = tokenizer.decode(sample_ids[:80].tolist())
             targets[targets == -100] = tokenizer.cls_token_id
             label_text = tokenizer.decode(targets[:38].tolist())
-            # log_master(f"***ids: {inputs.tolist()}", dist_cfg.is_master)
-            # log_master(f"***targets: {targets.tolist()}", dist_cfg.is_master)
             log_master(
                 f"***sample_output: {sample_output.tolist()}", dist_cfg.is_master
             )
